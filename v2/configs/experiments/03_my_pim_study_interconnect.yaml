@@ -1,0 +1,2 @@
+# interconnect_gpu.yaml — GPU-only 专用：只有一块 GPU，无跨设备连接
+links: []

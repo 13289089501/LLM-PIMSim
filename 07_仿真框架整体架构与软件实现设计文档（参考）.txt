@@ -1,0 +1,1088 @@
+《07_仿真框架整体架构与软件实现设计文档》
+
+项目：LLM-PIMSim
+模块：Simulation Framework Architecture（仿真框架整体架构与软件实现）
+版本：v1.0
+
+1. 文档目的
+
+前面的设计文档已经确定了：
+
+硬件模型
+数据模型
+LLM算子模型
+性能模型
+离散事件调度模型
+
+但是这些仍然属于：
+
+“理论模型”。
+
+本章负责解决：
+
+如何把这些模型组织成一个真正可以运行的软件系统。
+
+目标：
+
+设计一个：
+
+可扩展
+易修改
+方便加入新PIM架构
+方便复现实验
+
+的LLM-PIM模拟器框架。
+
+2. 软件设计原则
+2.1 模块解耦
+
+最重要原则：
+
+不允许模块之间直接修改内部状态。
+
+例如：
+
+错误：
+
+Scheduler直接修改Hardware.memory
+
+问题：
+
+以后加入：
+
+新存储器
+新互连
+新调度算法
+
+需要大量修改。
+
+正确：
+
+Scheduler
+
+    |
+
+调用接口
+
+    |
+
+Hardware Model
+2.2 配置驱动
+
+硬件参数不写死。
+
+例如：
+
+错误：
+
+DRAM_bandwidth = 500
+
+正确：
+
+配置文件：
+
+hardware:
+
+  DRAM_PIM:
+
+      bandwidth:
+          read:500
+          write:200
+
+这样可以快速模拟：
+
+SRAM-PIM
+DRAM-PIM
+ReRAM-PIM
+GPU+PIM
+2.3 模型与执行分离
+
+LLM结构：
+
+不应该知道：
+
+怎么执行。
+
+例如：
+
+Llama Layer：
+
+只描述：
+
+Attention
+
+FFN
+
+LayerNorm
+
+Scheduler决定：
+
+在哪里执行
+
+什么时候执行
+3. 总体软件架构
+
+最终软件结构：
+
+                    User Config
+
+                        |
+
+                        ▼
+
+
+              +----------------+
+
+              | Config Parser |
+
+              +----------------+
+
+                        |
+
+                        ▼
+
+
+        +--------------------------------+
+
+        |        Simulation Core         |
+
+        +--------------------------------+
+
+             |        |        |
+
+             ▼        ▼        ▼
+
+
+        LLM Model  Hardware  Data Model
+
+
+             |
+
+             ▼
+
+
+          Operator Graph
+
+
+             |
+
+             ▼
+
+
+          Scheduler
+
+
+             |
+
+             ▼
+
+
+       Performance Model
+
+
+             |
+
+             ▼
+
+
+          Result Analyzer
+
+4. Python工程目录设计
+
+建议：
+
+LLM-PIMSim/
+
+│
+
+├── main.py
+
+│
+
+├── config/
+
+│   ├── llm_config.yaml
+
+│   ├── hardware_config.yaml
+
+│   └── placement_config.yaml
+
+
+│
+
+├── models/
+
+│   ├── llm.py
+
+│   ├── operator.py
+
+│   └── data.py
+
+
+│
+
+├── hardware/
+
+│   ├── device.py
+
+│   ├── memory.py
+
+│   └── interconnect.py
+
+
+│
+
+├── performance/
+
+│   ├── compute_model.py
+
+│   ├── memory_model.py
+
+│   └── transfer_model.py
+
+
+│
+
+├── scheduler/
+
+│   ├── event.py
+
+│   ├── event_queue.py
+
+│   └── scheduler.py
+
+
+│
+
+├── simulator/
+
+│   └── simulator.py
+
+
+│
+
+├── analyzer/
+
+│   ├── report.py
+
+│   └── bottleneck.py
+
+
+│
+
+└── utils/
+
+    └── logger.py
+
+5. 各软件层职责
+5.1 Config层
+
+负责：
+
+读取用户配置。
+
+输入：
+
+yaml/json
+
+输出：
+
+Python对象。
+
+例如：
+
+Config
+{
+hardware,
+model,
+placement
+}
+5.2 Model层
+
+包含：
+
+LLM Model
+
+负责：
+
+生成Transformer计算图。
+
+Operator Model
+
+负责：
+
+描述计算任务。
+
+Data Model
+
+负责：
+
+描述数据生命周期。
+
+5.3 Hardware层
+
+描述：
+
+真实硬件。
+
+包括：
+
+Compute Unit
+Memory
+Interconnect
+5.4 Performance层
+
+计算：
+
+时间。
+
+输入：
+
+Operator
+
++
+
+Hardware
+
++
+
+Data
+
+输出：
+
+Latency
+5.5 Scheduler层
+
+负责：
+
+事件管理。
+
+包括：
+
+Event
+Queue
+Scheduling Policy
+5.6 Simulator Core
+
+负责：
+
+把所有模块连接。
+
+类似：
+
+操作系统中的：
+
+Kernel。
+
+6. 核心类设计
+
+下面定义主要Class。
+
+6.1 Simulator类
+
+最高层控制器。
+
+class Simulator:
+
+    def __init__(self, config):
+
+        self.llm_model
+
+        self.hardware
+
+        self.data_manager
+
+        self.scheduler
+
+        self.performance_model
+
+
+    def run():
+
+        scheduler.start()
+
+
+作用：
+
+启动一次完整模拟。
+
+6.2 LLMModel类
+class LLMModel:
+
+
+    layers
+
+
+    def build_graph():
+
+        create operators
+
+        create data
+
+        connect dependency
+
+
+例如：
+
+输入：
+
+layers:32
+hidden:4096
+
+生成：
+
+Layer0
+
+Layer1
+
+...
+
+Layer31
+6.3 Operator类
+class Operator:
+
+
+    id
+
+    type
+
+    inputs
+
+    outputs
+
+    flops
+
+    precision
+
+
+    def execute():
+
+        return latency
+
+6.4 DataObject类
+class DataObject:
+
+
+    id
+
+    size
+
+    location
+
+    ready_time
+
+
+6.5 Hardware类
+class Hardware:
+
+
+    devices
+
+
+    def can_execute(operator):
+
+        return True/False
+
+6.6 Device类
+
+代表一个计算模块。
+
+例如：
+
+GPU0
+
+DRAM-PIM0
+
+SRAM-PIM1
+
+结构：
+
+class Device:
+
+
+    name
+
+    compute_capacity
+
+    memory
+
+    busy_until
+
+6.7 Event类
+class Event:
+
+
+    type
+
+    start
+
+    end
+
+    resource
+
+7. 配置文件设计
+7.1 LLM配置
+
+文件：
+
+llm_config.yaml
+
+示例：
+
+model:
+
+ name:
+  Llama-like
+
+ layers:
+  32
+
+ hidden_size:
+  4096
+
+ heads:
+  32
+
+
+precision:
+ FP16
+
+7.2 Hardware配置
+devices:
+
+
+ GPU0:
+
+   type:
+    GPU
+
+
+   compute:
+
+      FP16:
+       100 TFLOPS
+
+
+   memory:
+
+      bandwidth:
+       900 GB/s
+
+
+
+ DRAM_PIM0:
+
+
+   type:
+    DRAM_PIM
+
+
+   compute:
+
+      FP16:
+       20 TOPS
+
+
+7.3 Placement配置
+
+决定：
+
+权重在哪里。
+
+例如：
+
+placement:
+
+
+weights:
+
+
+ FFN:
+
+   DRAM_PIM0
+
+
+ Attention:
+
+   GPU0
+
+
+
+KV_cache:
+
+ SRAM_PIM0
+
+8. Simulator运行流程
+
+完整流程：
+
+main.py
+
+
+ |
+
+读取配置
+
+
+ |
+
+创建Hardware
+
+
+ |
+
+创建LLM Model
+
+
+ |
+
+生成Operator Graph
+
+
+ |
+
+创建Data Object
+
+
+ |
+
+初始化Placement
+
+
+ |
+
+创建Scheduler
+
+
+ |
+
+开始Simulation
+
+
+ |
+
+生成Report
+
+9. main.py设计
+
+伪代码：
+
+from simulator import Simulator
+
+
+config = load_config()
+
+
+sim = Simulator(config)
+
+
+result = sim.run()
+
+
+result.export()
+
+10. Simulation主循环
+
+核心：
+
+while not event_queue.empty():
+
+
+    event = queue.pop()
+
+
+    current_time = event.end
+
+
+    update(event)
+
+
+    scheduler.check_ready()
+
+11. 数据流
+
+整个系统数据流：
+
+Config
+
+ ↓
+
+LLM Generator
+
+ ↓
+
+Operator Graph
+
+ ↓
+
+Data Dependency
+
+ ↓
+
+Scheduler
+
+ ↓
+
+Performance Model
+
+ ↓
+
+Event
+
+ ↓
+
+Timeline
+
+ ↓
+
+Report
+
+12. 输出结果设计
+
+一次模拟应该生成：
+
+12.1 总延迟
+
+例如：
+
+Total latency:
+
+125 ms
+
+12.2 时间分解
+
+例如：
+
+Compute:
+
+40 ms
+
+
+Memory:
+
+30 ms
+
+
+Transfer:
+
+45 ms
+
+
+Synchronization:
+
+10 ms
+
+12.3 瓶颈分析
+
+例如：
+
+Main Bottleneck:
+
+Communication Bound
+
+
+Reason:
+
+Weight movement dominates
+
+12.4 Timeline
+
+类似：
+
+0-10ms
+
+Weight Transfer
+
+
+10-15ms
+
+FFN Compute
+
+
+15-20ms
+
+KV Transfer
+
+13. 实验模式设计
+
+为了方便研究论文：
+
+建议支持三种模式。
+
+13.1 Architecture Comparison
+
+比较：
+
+不同硬件。
+
+例如：
+
+GPU
+
+vs
+
+GPU+DRAM-PIM
+
+vs
+
+GPU+SRAM-PIM
+
+13.2 Placement Study
+
+研究：
+
+权重位置。
+
+例如：
+
+方案A：
+
+All Weight in GPU
+
+方案B：
+
+FFN Weight in PIM
+13.3 Bottleneck Analysis
+
+固定硬件：
+
+改变：
+
+Batch
+Sequence Length
+Precision
+
+观察：
+
+瓶颈变化。
+
+14. 后续扩展接口
+
+未来可以加入：
+
+14.1 自动Placement优化
+
+新增：
+
+Placement Optimizer
+
+目标：
+
+min(TotalLatency)
+14.2 自动Mapping
+
+新增：
+
+Mapping Optimizer
+
+决定：
+
+Operator → Hardware
+
+14.3 功耗模型
+
+新增：
+
+Power Model
+
+计算：
+
+Energy=Power×Time
+14.4 精确PIM器件模型
+
+新增：
+
+例如：
+
+ReRAM：
+
+crossbar size
+
+ADC latency
+
+DAC latency
+
+15. 第一版开发顺序建议
+
+不要一次写完整系统。
+
+推荐：
+
+Phase 1：最小可运行版本
+
+实现：
+
+✅ Operator
+✅ Data
+✅ Hardware
+✅ Performance Formula
+✅ Scheduler
+
+目标：
+
+运行：
+
+一个Transformer Layer。
+
+Phase 2：完整LLM
+
+加入：
+
+✅ 多Layer
+✅ Prefill
+✅ Decode
+✅ KV Cache
+
+Phase 3：PIM研究功能
+
+加入：
+
+✅ Weight Residency
+✅ Placement Analysis
+✅ Different PIM Device
+
+16. 第一版技术选型建议
+编程语言
+
+推荐：
+
+Python。
+
+原因：
+
+快速开发
+科研友好
+配置方便
+不推荐：
+
+C++第一版。
+
+原因：
+
+当前最大风险不是性能。
+
+而是：
+
+模型设计错误导致大量重构。
+
+17. 测试策略
+
+必须设计单元测试。
+
+Hardware测试
+
+验证：
+
+bandwidth
+
+latency
+
+capacity
+
+Performance测试
+
+例如：
+
+已知：
+
+FLOPs=10
+12
+
+验证：
+
+输出时间正确。
+
+Scheduler测试
+
+构造：
+
+两个依赖任务。
+
+验证：
+
+等待是否正确。
+
+18. 当前系统完整架构
+
+最终：
+
+                 User
+
+                  |
+
+                  ▼
+
+             Config File
+
+
+                  |
+
+                  ▼
+
+
+             Simulator
+
+
+                  |
+
+    --------------------------------
+
+    |              |              |
+
+    ▼              ▼              ▼
+
+
+LLM Model     Hardware      Data Model
+
+
+    |              |              |
+
+    -------- Operator Graph -------
+
+
+                  |
+
+                  ▼
+
+
+              Scheduler
+
+
+                  |
+
+                  ▼
+
+
+          Performance Model
+
+
+                  |
+
+                  ▼
+
+
+              Event Queue
+
+
+                  |
+
+                  ▼
+
+
+              Result Report
+
+19. 当前设计评价
+
+经过前面7个模块设计，现在这个Sim已经具备：
+
+能力	支持
+LLM结构模拟	✅
+Transformer算子级分析	✅
+PIM硬件抽象	✅
+权重驻留分析	✅
+KV Cache分析	✅
+数据搬运分析	✅
+带宽/计算瓶颈判断	✅
+论文架构复现基础	✅
+
+但是目前仍然缺少两个重要部分：

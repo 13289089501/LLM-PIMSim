@@ -1,0 +1,1172 @@
+《02_硬件模型模块设计文档》
+
+项目：LLM-PIMSim
+模块：Hardware Model（硬件模型模块）
+版本：v1.0
+
+1. 模块概述
+1.1 模块目的
+
+Hardware Model负责描述LLM-PIMSim中参与计算和数据存储的硬件资源。
+
+该模块不对真实芯片进行周期级、RTL级或者电路级建模，而是从体系结构性能分析角度抽象硬件的主要能力。
+
+其核心任务是回答：
+
+一个算子能不能在这个硬件上执行？如果可以，这个硬件能够以多大的性能执行它？
+
+同时向其他模块提供硬件状态和能力信息。
+
+2. 模块在系统中的位置
+
+Hardware Model处于整个模拟器的基础层。
+
+                 LLM Model
+                     │
+                     ▼
+               Operator Model
+                     │
+                     │
+                     ▼
+              ┌──────────────┐
+              │ Hardware     │
+              │ Model        │
+              └──────────────┘
+                 │    │    │
+        ┌────────┘    │    └────────┐
+        ▼             ▼             ▼
+   Performance     Scheduler    Data Placement
+      Model
+        │             │
+        └──────┬──────┘
+               ▼
+         Simulation Result
+
+Hardware Model本身不负责：
+
+决定算子执行顺序
+决定数据应该放在哪里
+计算最终仿真时间
+分析性能瓶颈
+
+这些分别由：
+
+Scheduler
+Data Placement Model
+Performance Model
+Bottleneck Analyzer
+
+负责。
+
+3. 设计原则
+3.1 能力与状态分离
+
+这是本模块最重要的设计原则。
+
+硬件对象需要区分：
+
+静态能力
+
+例如：
+
+Peak Compute
+Memory Capacity
+Supported Precision
+Read Bandwidth
+Write Bandwidth
+
+这些描述：
+
+“这个硬件理论上能做什么。”
+
+动态状态
+
+例如：
+
+Available Time
+Current Task
+Occupied
+
+这些描述：
+
+“这个硬件当前正在做什么。”
+
+因此不建议将所有信息都放在一个简单的参数表中。
+
+4. Hardware Unit抽象
+
+系统中的所有计算/存储资源统一抽象成：
+
+Hardware Unit
+
+例如：
+
+GPU-0
+DRAM-PIM-0
+SRAM-PIM-0
+ReRAM-PIM-0
+5. Hardware Unit数据结构
+
+建议第一版采用如下结构：
+
+class HardwareUnit:
+
+    id
+
+    name
+
+    type
+
+    compute_capability
+
+    supported_precision
+
+    memory_capacity
+
+    read_bandwidth
+
+    write_bandwidth
+
+    read_latency
+
+    write_latency
+
+    parallelism
+
+    efficiency_table
+
+    available_time
+
+    current_task
+6. Hardware Unit属性说明
+6.1 id
+
+硬件模块唯一标识。
+
+例如：
+
+gpu0
+pim_dram0
+pim_sram0
+pim_reram0
+
+作用：
+
+用于其他模块引用硬件。
+
+6.2 name
+
+硬件名称。
+
+例如：
+
+NVIDIA GPU
+DRAM-PIM
+SRAM-PIM
+ReRAM-PIM
+
+主要用于：
+
+日志
+输出报告
+可视化
+6.3 type
+
+表示硬件类别。
+
+建议第一版：
+
+GPU
+DRAM_PIM
+SRAM_PIM
+RERAM_PIM
+CPU
+
+这里建议不要把硬件类型直接与具体厂商绑定。
+
+例如不要定义：
+
+NVIDIA_H100
+
+作为硬件类型。
+
+更合理的是：
+
+type = GPU
+name = H100-like
+
+这样以后可以增加不同GPU配置，而不需要修改模拟器核心代码。
+
+7. 计算能力模型
+7.1 Peak Compute
+
+表示硬件理论峰值计算能力。
+
+例如：
+
+GPU:
+
+Peak Compute = 1000 TFLOPS
+
+或者：
+
+PIM:
+
+Peak Compute = 50 TOPS
+7.2 为什么不直接使用Peak Compute？
+
+因为：
+
+峰值计算能力 ≠ 实际计算能力。
+
+真实执行过程中会存在：
+
+并行度不足
+数据尺寸不匹配
+算子硬件适配程度不同
+硬件利用率不足
+
+因此需要引入：
+
+Compute Efficiency
+8. Compute Efficiency模型
+
+定义：
+
+Efficiency=
+Peak Throughput
+Actual Throughput
+	​
+
+
+因此：
+
+T
+compute
+	​
+
+=
+PeakCompute×Efficiency
+FLOPs
+	​
+
+9. Efficiency不是硬件固定参数
+
+这是本项目中特别需要注意的一点。
+
+不能简单定义：
+
+GPU efficiency = 0.8
+
+然后所有算子都使用0.8。
+
+因为：
+
+同一个硬件对不同算子的执行效率可能完全不同。
+
+例如：
+
+GPU
+
+GEMM        0.85
+Softmax     0.30
+LayerNorm   0.25
+
+因此：
+
+Efficiency =
+f(Hardware, Operator)
+10. Efficiency Table
+
+第一版采用查表方式。
+
+例如：
+
+{
+    "GPU": {
+        "GEMM": 0.85,
+        "Softmax": 0.30,
+        "LayerNorm": 0.25
+    },
+
+    "DRAM_PIM": {
+        "GEMM": 0.70,
+        "Softmax": 0.20,
+        "LayerNorm": 0.15
+    }
+}
+
+Performance Model根据：
+
+Hardware Type
++
+Operator Type
+
+查询对应效率。
+
+11. Efficiency数据来源
+
+这里必须明确：
+
+模拟器本身不应该假装这些效率是理论常数。
+
+实际数值应该来自：
+
+硬件厂商公开数据
+论文实验结果
+用户实测数据
+用户自行估计
+
+因此配置文件中的效率应该被视为：
+
+用户提供的架构假设参数
+
+而不是模拟器内置的绝对真值。
+
+12. Precision模型
+
+硬件模型需要描述：
+
+该计算模块支持什么精度。
+
+我们已经确定第一版采用：
+
+HIGH
+LOW
+
+两个抽象等级。
+
+13. Precision的设计目的
+
+Precision在本模拟器中的主要目的不是研究量化误差。
+
+而是解决：
+
+一个算子是否能够映射到某个计算模块。
+
+例如：
+
+Operator:
+
+required_precision = HIGH
+
+而：
+
+ReRAM-PIM:
+
+supported_precision = LOW
+
+则：
+
+ReRAM-PIM
+    ×
+Attention
+
+不可执行。
+
+14. Precision兼容规则
+
+定义：
+
+Hardware Precision Level
+        >=
+Operator Precision Level
+
+才能执行。
+
+例如：
+
+HIGH = 2
+LOW  = 1
+
+那么：
+
+算子	硬件	是否可执行
+HIGH	HIGH	✓
+LOW	HIGH	✓
+LOW	LOW	✓
+HIGH	LOW	×
+15. Precision模型的扩展性
+
+虽然第一版只有：
+
+HIGH
+LOW
+
+但软件内部不应该把代码写死为两个字符串。
+
+后续可以扩展：
+
+FP32
+FP16
+BF16
+FP8
+INT8
+INT4
+
+例如：
+
+Precision Level
+
+FP32 = 5
+FP16 = 4
+BF16 = 4
+FP8  = 3
+INT8 = 2
+INT4 = 1
+
+但是需要注意：
+
+真实硬件的精度兼容关系并不一定能够简单用“数值大小”表示。
+
+例如FP16和INT8并不是严格的“谁精度更高”的简单关系。
+
+所以后续如果真的扩展到多精度，建议从：
+
+precision_level
+
+升级成：
+
+supported_precisions = [
+    FP16,
+    INT8
+]
+
+即采用能力集合匹配。
+
+第一版暂时使用HIGH/LOW即可。
+
+16. 存储容量模型
+
+每个Hardware Unit可以具有本地存储空间。
+
+定义：
+
+memory_capacity
+
+例如：
+
+GPU HBM:
+
+80 GB
+DRAM-PIM:
+
+512 GB
+17. 容量的作用
+
+主要用于判断：
+
+某个Data Object是否能够放入该硬件。
+
+例如：
+
+模型权重：
+
+140 GB
+
+GPU：
+
+80 GB
+
+则：
+
+Weight cannot fully reside in GPU
+
+但是：
+
+第一版可以允许数据分片。
+
+例如：
+
+Weight
+
+140 GB
+
+↓
+
+GPU:
+
+80 GB
+
+DRAM-PIM:
+
+60 GB
+
+这为后面的Data Placement和Mapping提供基础。
+
+18. 本地存储带宽
+
+Hardware Unit需要区分：
+
+Read Bandwidth
+
+Write Bandwidth
+
+而不是只使用：
+
+Bandwidth
+
+原因是：
+
+不同存储介质：
+
+Read和Write性能可能不同。
+
+例如：
+
+DRAM:
+
+Read BW  = 800 GB/s
+Write BW = 600 GB/s
+19. 本地存储访问延迟
+
+同样区分：
+
+Read Latency
+
+Write Latency
+
+因此：
+
+Read
+T
+read
+	​
+
+=L
+read
+	​
+
++
+BW
+read
+	​
+
+D
+	​
+
+Write
+T
+write
+	​
+
+=L
+write
+	​
+
++
+BW
+write
+	​
+
+D
+	​
+
+20. 为什么Hardware Model只负责本地访问？
+
+这是本版本相比之前设计的一个重要调整。
+
+例如：
+
+GPU → DRAM-PIM
+
+这里涉及：
+
+GPU Read
++
+Interconnect
++
+DRAM-PIM Write
+
+其中：
+
+GPU Read：
+
+属于GPU自身能力。
+
+DRAM-PIM Write：
+
+属于DRAM-PIM自身能力。
+
+但是：
+
+GPU → DRAM-PIM
+
+的：
+
+Link Bandwidth
+Link Latency
+Routing
+
+属于：
+
+Interconnect Model
+
+因此：
+
+Hardware Model和Interconnect Model分开。
+
+21. Parallelism模型
+
+硬件需要描述并行执行能力。
+
+例如：
+
+GPU：
+
+many parallel execution units
+
+PIM：
+
+multiple banks / arrays
+
+第一版不需要模拟具体：
+
+SM
+Bank
+MAC array
+PE
+
+而只需要抽象成：
+
+parallelism
+
+例如：
+
+GPU:
+
+parallelism = 100
+PIM:
+
+parallelism = 16
+22. Parallelism的作用
+
+主要用于后续Performance Model。
+
+例如一个任务：
+
+Workload = 16 units
+
+硬件：
+
+parallelism = 4
+
+则理论上：
+
+4-way parallel execution
+
+但这里需要注意：
+
+第一版不要直接把Parallelism简单除进执行时间。
+
+因为Parallelism最终应该和：
+
+算子可分割性
+数据布局
+Efficiency
+
+共同决定实际执行时间。
+
+因此Hardware Model只提供：
+
+parallelism capability
+
+具体怎么使用由Performance Model决定。
+
+23. Hardware状态模型
+
+除了静态参数之外，Hardware Unit需要维护动态状态。
+
+available_time
+
+current_task
+
+status
+23.1 available_time
+
+表示：
+
+当前硬件最早什么时候可以再次执行任务。
+
+例如：
+
+GPU.available_time = 10 ms
+
+表示：
+
+GPU在10ms之前不可用于新的独占任务。
+
+23.2 current_task
+
+表示：
+
+当前执行任务。
+
+例如：
+
+current_task = "FFN_L3"
+
+如果没有任务：
+
+current_task = None
+23.3 status
+
+第一版：
+
+IDLE
+BUSY
+
+未来可以扩展：
+
+WAITING
+TRANSFERRING
+COMPUTING
+
+但目前不建议过度复杂化。
+
+24. GPU模型
+
+GPU作为传统基准计算设备。
+
+典型抽象：
+
+GPU
+├── High precision compute
+├── Large memory bandwidth
+├── High peak compute
+└── General-purpose operators
+
+参数包括：
+
+Peak Compute
+Supported Precision
+Memory Capacity
+Read BW
+Write BW
+Read Latency
+Write Latency
+Parallelism
+Efficiency Table
+25. DRAM-PIM模型
+
+DRAM-PIM重点模拟：
+
+大容量存储 + 存储附近计算。
+
+典型特征：
+
+Large Capacity
+High Memory Bandwidth
+Moderate Compute
+Low/Medium Precision
+
+在模拟器中：
+
+type = DRAM_PIM
+25.1 DRAM-PIM的主要研究意义
+
+重点用于研究：
+
+将权重驻留在DRAM附近后，能够减少多少数据移动。
+
+例如：
+
+Weight
+
+DRAM-PIM
+
+↓
+
+PIM Compute
+
+此时：
+
+Weight Transfer = 0
+
+如果算子直接在DRAM-PIM执行。
+
+26. SRAM-PIM模型
+
+SRAM-PIM重点：
+
+Low Latency
+High Local Bandwidth
+Limited Capacity
+High-Speed Compute
+
+适合研究：
+
+延迟敏感算子
+局部数据处理
+高速缓存式PIM
+27. ReRAM-PIM模型
+
+ReRAM-PIM重点：
+
+High Parallel Compute
+Low/Restricted Precision
+High Energy Efficiency
+Non-volatile Storage
+
+第一版只需要体现：
+
+Compute Capability
+Precision Restriction
+Memory Capacity
+Read/Write Characteristics
+
+不模拟：
+
+ADC
+DAC
+crossbar transistor
+device variation
+IR drop
+
+等电路级细节。
+
+28. 不同硬件并不意味着固定模板
+
+这里有一个重要设计原则：
+
+不要在代码中写：
+
+if type == GPU:
+    ...
+elif type == DRAM_PIM:
+    ...
+elif type == SRAM_PIM:
+    ...
+
+然后把大量逻辑写死。
+
+更合理的是：
+
+所有硬件都实现统一接口：
+
+HardwareUnit
+
+不同硬件只是：
+
+参数不同。
+
+29. 推荐的软件类结构
+HardwareUnit
+│
+├── GPU
+├── DRAMPIM
+├── SRAMPIM
+└── ReRAMPIM
+
+第一版甚至可以不真正建立四个复杂子类，而采用：
+
+HardwareUnit(
+    type="GPU",
+    ...
+)
+
+配置驱动。
+
+等未来出现真正不同的行为，再引入继承。
+
+这是为了避免：
+
+为了模拟器第一版而过早进行复杂的软件架构设计。
+
+30. Hardware Configuration示例
+
+建议使用JSON：
+
+{
+    "id": "gpu0",
+    "name": "GPU-0",
+    "type": "GPU",
+
+    "compute": {
+        "peak": 300,
+        "unit": "TFLOPS"
+    },
+
+    "precision": [
+        "HIGH",
+        "LOW"
+    ],
+
+    "memory": {
+        "capacity": 80,
+        "unit": "GB",
+
+        "read_bandwidth": 2000,
+        "write_bandwidth": 1800,
+        "bandwidth_unit": "GB/s",
+
+        "read_latency": 100,
+        "write_latency": 100,
+        "latency_unit": "ns"
+    },
+
+    "parallelism": 100,
+
+    "efficiency": {
+        "GEMM": 0.85,
+        "Attention": 0.60,
+        "Softmax": 0.30,
+        "LayerNorm": 0.25
+    }
+}
+31. Hardware Model与其他模块的接口
+
+Hardware Model不是孤立存在的。
+
+与Operator Model
+
+Operator询问：
+
+Can this hardware execute me?
+
+Hardware Model返回：
+
+precision compatibility
+compute capability
+与Data Placement Model
+
+Data Placement询问：
+
+Can this data fit here?
+
+Hardware Model返回：
+
+memory capacity
+与Performance Model
+
+Performance Model读取：
+
+Peak Compute
+Efficiency
+Read BW
+Write BW
+Read Latency
+Write Latency
+Parallelism
+
+计算执行时间。
+
+与Scheduler
+
+Scheduler读取：
+
+available_time
+current_task
+
+决定：
+
+什么时候能够将任务放到该Hardware Unit上。
+
+32. Hardware Model与Interconnect Model的边界
+
+这一点需要在代码和文档中明确。
+
+Hardware Model负责：
+设备本身
+│
+├── Compute
+├── Local Memory
+├── Read
+├── Write
+├── Precision
+└── Parallelism
+Interconnect Model负责：
+设备之间
+│
+├── Link
+├── Bandwidth
+├── Latency
+└── Connectivity
+
+因此：
+
+GPU → DRAM-PIM
+
+的完整时间：
+
+T
+transfer
+	​
+
+=T
+GPU−read
+	​
+
++T
+link
+	​
+
++T
+PIM−write
+	​
+
+
+三部分分别由：
+
+Hardware Model
++
+Interconnect Model
++
+Hardware Model
+
+共同提供参数。
+
+33. Hardware Model不负责的内容
+
+为了避免模块职责混乱，本模块明确不负责：
+
+不负责算子执行时间
+
+由Performance Model负责。
+
+不负责任务执行顺序
+
+由Scheduler负责。
+
+不负责数据放置
+
+由Data Placement Model负责。
+
+不负责设备之间网络传输
+
+由Interconnect Model负责。
+
+不负责性能瓶颈分类
+
+由Bottleneck Analyzer负责。
+
+34. 第一版实现要求
+
+第一版Hardware Model必须实现：
+
+基础硬件描述
+Hardware ID
+Hardware Type
+Compute Capability
+Memory Capacity
+存储性能
+Read Bandwidth
+Write Bandwidth
+Read Latency
+Write Latency
+计算能力
+Peak Compute
+Operator Efficiency
+约束
+Supported Precision
+Parallelism
+动态状态
+Available Time
+Current Task
+35. 第一版暂不实现
+
+以下内容暂时不要加入：
+
+GPU SM级模拟
+DRAM Bank级模拟
+SRAM Array级模拟
+ReRAM Crossbar级模拟
+ADC/DAC详细模型
+Cache层级
+NUMA
+Coherence
+电压频率动态变化
+温度模型
+功耗模型
+
+原因是这些内容会迅速把项目从：
+
+LLM-PIM架构探索模拟器
+
+推向：
+
+微体系结构/电路级模拟器。
+
+与项目当前目标不匹配。
+
+36. 模块核心设计总结
+
+Hardware Model最终回答三个问题：
+
+① 能不能算？
+
+由：
+
+Supported Precision
++
+Compute Capability
+
+决定。
+
+② 算得有多快？
+
+由：
+
+Peak Compute
++
+Efficiency
++
+Parallelism
+
+提供基础参数。
+
+③ 本地数据访问有多快？
+
+由：
+
+Read/Write Bandwidth
++
+Read/Write Latency
+
+提供基础参数。
+
+而：
+
+设备之间怎么移动数据
+
+不属于Hardware Model，而由下一阶段的：
+
+Interconnect & Data Movement Model
+
+负责。
+
+37. 与整个模拟器的关系
+
+最终形成：
+
+                  Hardware Model
+                         │
+           ┌─────────────┼─────────────┐
+           │             │             │
+           ▼             ▼             ▼
+     Performance     Data Placement  Scheduler
+        Model            Model          │
+           │             │              │
+           └─────────────┼──────────────┘
+                         ▼
+                  Interconnect Model
+                         │
+                         ▼
+                  Event Simulation
+                         │
+                         ▼
+                  Bottleneck Analysis
+
+因此，Hardware Model是整个模拟器的“硬件能力描述层”，而不是“硬件执行模拟器”本身。
+
+本模块目前确定的核心参数
+类别	参数
+身份	ID、Name、Type
+计算	Peak Compute
+计算效率	Operator Efficiency
+精度	Supported Precision
+存储	Capacity
+读取	Read Bandwidth、Read Latency
+写入	Write Bandwidth、Write Latency
+并行	Parallelism
+状态	Available Time、Current Task

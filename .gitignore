@@ -1,0 +1,10 @@
+# 仓库根 .gitignore —— 排除工具状态与旧版本目录
+
+# ── Kun / Superdesign 工具运行时状态（非项目内容）──
+.kun/
+.kun-canvas/
+
+# ── 旧版本目录（v1 为早期实现；如需保留历史，删除此规则并自行 git add v1/）──
+/v1/
+
+# v2 子项目内部的忽略规则见 v2/.gitignore

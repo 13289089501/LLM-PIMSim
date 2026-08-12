@@ -1,0 +1,1125 @@
+《08_仿真实验设计与结果分析模块设计文档》
+
+项目：LLM-PIMSim
+模块：Experiment & Analysis Framework（实验设计与结果分析模块）
+版本：v1.0
+
+1. 模块概述
+1.1 模块目的
+
+前面的模块已经能够完成：
+
+LLM模型构建
+算子生成
+数据放置
+硬件执行
+时间模拟
+
+但是一个科研级模拟器不能只输出：
+
+“总时间是多少”。
+
+真正研究PIM加速LLM时，需要回答：
+
+问题1：
+
+为什么这个架构更快？
+
+例如：
+
+论文声称：
+
+PIM减少了数据搬运。
+
+模拟器应该能够验证：
+
+Transfer Time:
+
+45ms
+
+↓
+
+5ms
+
+问题2：
+
+什么时候PIM没有收益？
+
+例如：
+
+小模型：
+
+计算时间占主导：
+
+Compute:
+
+90%
+
+Transfer:
+
+10%
+
+即使减少搬运，也不会明显加速。
+
+问题3：
+
+瓶颈在哪里？
+
+例如：
+
+同样是Memory Bound：
+
+可能来自：
+
+HBM带宽不足
+NoC带宽不足
+KV Cache访问不足
+
+因此：
+
+Experiment & Analysis模块负责：
+
+将仿真结果转换为具有研究意义的数据。
+
+2. 模块位置
+
+整体架构：
+
+              Simulator
+
+                  |
+
+                  ▼
+
+             Event Trace
+
+                  |
+
+                  ▼
+
+        +----------------+
+
+        | Result Parser  |
+
+        +----------------+
+
+                  |
+
+        -----------------------
+
+        |                     |
+
+        ▼                     ▼
+
+ Performance Report     Bottleneck Analyzer
+
+
+        |
+
+        ▼
+
+ Visualization
+
+3. 设计目标
+
+该模块需要支持：
+
+3.1 单次实验分析
+
+例如：
+
+模拟：
+
+Llama-7B
+
+GPU+PIM
+
+Batch=1
+
+Seq=2048
+
+
+输出：
+
+Latency
+
+Bandwidth
+
+Bottleneck
+
+3.2 架构比较
+
+例如：
+
+比较：
+
+方案A：
+
+GPU only
+
+方案B：
+
+GPU + DRAM-PIM
+
+方案C：
+
+GPU + SRAM-PIM
+
+输出：
+
+Speedup。
+
+3.3 参数敏感性分析
+
+例如：
+
+改变：
+
+Batch Size
+Sequence Length
+Precision
+Memory Bandwidth
+
+观察：
+
+性能变化。
+
+4. 实验模型设计
+
+一次实验定义为：
+
+Experiment=(Model,Hardware,Mapping,Workload)
+
+其中：
+
+4.1 Model
+
+LLM模型。
+
+例如：
+
+model:
+
+layers:32
+
+hidden:4096
+
+4.2 Hardware
+
+硬件架构。
+
+例如：
+
+hardware:
+
+GPU
+
++
+
+DRAM-PIM
+
+4.3 Mapping
+
+算子映射。
+
+例如：
+
+FFN:
+
+DRAM-PIM
+
+
+Attention:
+
+GPU
+
+4.4 Workload
+
+工作负载。
+
+包括：
+
+Prefill
+Decode
+5. 实验配置文件设计
+
+建议：
+
+增加：
+
+experiment_config.yaml
+
+示例：
+
+experiment:
+
+ name:
+
+  llama_pim_test
+
+
+model:
+
+ config:
+
+  llama7b.yaml
+
+
+hardware:
+
+ config:
+
+  gpu_dram_pim.yaml
+
+
+placement:
+
+ config:
+
+  ffn_pim.yaml
+
+
+workload:
+
+ mode:
+
+  decode
+
+
+ batch:
+
+  1
+
+
+ sequence:
+
+  2048
+
+6. Result模型
+
+仿真结束后：
+
+生成：
+
+SimulationResult
+
+结构：
+
+class SimulationResult:
+
+
+    total_latency
+
+
+    compute_time
+
+
+    memory_time
+
+
+    transfer_time
+
+
+    synchronization_time
+
+
+    event_trace
+
+
+    operator_statistics
+
+7. 时间统计模型
+
+总时间：
+
+T
+total
+	​
+
+
+拆分：
+
+T
+total
+	​
+
+=T
+c
+	​
+
++T
+m
+	​
+
++T
+t
+	​
+
++T
+s
+	​
+
+
+其中：
+
+Compute
+
+计算时间：
+
+T
+c
+	​
+
+Memory
+
+本地存储：
+
+T
+m
+	​
+
+Transfer
+
+跨设备：
+
+T
+t
+	​
+
+Synchronization
+
+等待：
+
+T
+s
+	​
+
+8. Bottleneck Analyzer设计
+
+这是研究价值最高的模块之一。
+
+8.1 基本思想
+
+统计：
+
+各类时间占比：
+
+Ratio
+i
+	​
+
+=
+T
+total
+	​
+
+T
+i
+	​
+
+	​
+
+
+例如：
+
+结果：
+
+Compute:
+
+30%
+
+
+Memory:
+
+20%
+
+
+Transfer:
+
+45%
+
+
+Sync:
+
+5%
+
+
+则：
+
+判断：
+
+Communication Bound
+
+9. 瓶颈分类
+
+第一版：
+
+定义：
+
+Compute Bound
+
+条件：
+
+T
+c
+	​
+
+/T
+total
+	​
+
+>50%
+
+输出：
+
+Computation dominates
+
+Memory Bound
+
+条件：
+
+T
+m
+	​
+
+/T
+total
+	​
+
+>50%
+Communication Bound
+
+条件：
+
+T
+t
+	​
+
+/T
+total
+	​
+
+>50%
+Synchronization Bound
+
+条件：
+
+T
+s
+	​
+
+/T
+total
+	​
+
+>50%
+10. 为什么不能只看总Latency
+
+例如：
+
+方案A：
+
+Latency:
+
+100ms
+
+方案B：
+
+Latency:
+
+80ms
+
+只能知道：
+
+B快。
+
+但是不知道：
+
+为什么快。
+
+可能：
+
+方案B：
+
+减少：
+
+Transfer：
+
+60ms→20ms
+
+但：
+
+Compute增加：
+
+20ms→40ms
+
+如果只看Latency：
+
+无法解释。
+
+11. Operator级分析
+
+必须统计：
+
+每个算子的贡献。
+
+例如：
+
+Layer0 Attention:
+
+10ms
+
+
+Layer0 FFN:
+
+30ms
+
+
+Layer1 Attention:
+
+12ms
+
+
+Layer1 FFN:
+
+35ms
+
+
+可以发现：
+
+瓶颈：
+
+来自：
+
+FFN。
+
+12. Operator统计模型
+
+每个Operator保存：
+
+OperatorResult:
+
+
+name
+
+
+execution_time
+
+
+compute_time
+
+
+memory_time
+
+
+transfer_time
+
+
+hardware
+
+
+
+例如：
+
+输出：
+
+FFN Layer3
+
+Hardware:
+
+DRAM-PIM
+
+
+Latency:
+
+4ms
+
+
+Breakdown:
+
+Compute:
+
+2ms
+
+Transfer:
+
+0ms
+
+Memory:
+
+2ms
+
+13. Speedup分析
+
+架构比较核心指标：
+
+Speedup=
+T
+new
+	​
+
+T
+baseline
+	​
+
+	​
+
+
+例如：
+
+Baseline:
+
+GPU:
+
+100ms
+
+PIM:
+
+40ms
+
+则：
+
+Speedup=2.5
+14. Energy扩展接口
+
+虽然第一版不实现功耗。
+
+但是结果接口预留：
+
+EnergyResult:
+
+
+compute_energy
+
+
+memory_energy
+
+
+transfer_energy
+
+
+未来：
+
+加入：
+
+Energy=P×T
+15. 数据移动分析
+
+PIM论文最关注：
+
+数据移动。
+
+因此需要输出：
+
+总搬运量
+D
+total
+	​
+
+
+例如：
+
+Weight Transfer:
+
+50GB
+
+
+Activation Transfer:
+
+10GB
+
+KV Transfer:
+
+100GB
+
+不同数据类型占比
+
+例如：
+
+KV Cache:
+
+70%
+
+
+Weight:
+
+20%
+
+
+Activation:
+
+10%
+
+16. Weight Residency分析
+
+专门统计：
+
+命中次数
+
+例如：
+
+FFN Weight Residency:
+
+95%
+
+节省搬运量
+
+计算：
+
+如果没有驻留：
+
+D
+transfer
+original
+	​
+
+
+实际：
+
+D
+transfer
+PIM
+	​
+
+
+差值：
+
+ΔD
+17. KV Cache分析
+
+Decode阶段：
+
+重点输出：
+
+KV Cache大小变化
+
+例如：
+
+Token:
+
+1
+
+512
+
+1024
+
+2048
+
+
+KV Size:
+
+1GB
+
+512GB
+
+KV访问时间
+
+例如：
+
+Attention KV Read:
+
+60% latency
+
+18. Timeline可视化
+
+输出类似：
+
+Time
+
+
+0ms                         20ms
+
+
+GPU:
+
+| Attention | FFN |
+
+
+PIM0:
+
+| Weight Load | FFN |
+
+
+PIM1:
+
+| FFN |
+
+
+Link:
+
+| Transfer |
+
+
+用途：
+
+分析：
+
+并行是否充分
+等待在哪里产生
+哪个模块空闲
+19. 实验自动化框架
+
+支持：
+
+批量实验。
+
+例如：
+
+experiments/
+
+
+exp1_gpu.yaml
+
+exp2_dram_pim.yaml
+
+exp3_sram_pim.yaml
+
+
+自动运行：
+
+python run.py experiments/
+
+输出：
+
+results/
+
+
+exp1.json
+
+exp2.json
+
+exp3.json
+
+20. 参数扫描
+
+例如：
+
+测试：
+
+Memory Bandwidth：
+
+100GB/s
+
+200GB/s
+
+400GB/s
+
+800GB/s
+
+自动生成：
+
+Latency vs Bandwidth
+
+
+用于回答：
+
+增加带宽是否还能提升性能？
+
+21. 与其他模块接口
+与Scheduler
+
+获取：
+
+Event Trace
+
+与Performance Model
+
+获取：
+
+Latency Breakdown
+
+与Data Model
+
+获取：
+
+Data Movement Statistics
+
+22. 第一版必须实现
+
+必须：
+
+✅ 总Latency统计
+✅ 时间分解
+✅ Operator统计
+✅ Transfer统计
+✅ Bottleneck判断
+✅ Speedup计算
+✅ JSON结果输出
+
+23. 第一版暂不实现
+
+暂不实现：
+
+❌ 自动论文图生成
+❌ 功耗模型
+❌ 热分析
+❌ 成本模型
+❌ 自动优化搜索
+
+24. 一个完整实验流程
+                Experiment Config
+
+
+                       |
+
+                       ▼
+
+
+              Build Simulator
+
+
+                       |
+
+                       ▼
+
+
+              Run Simulation
+
+
+                       |
+
+                       ▼
+
+
+              Collect Events
+
+
+                       |
+
+                       ▼
+
+
+             Analyze Result
+
+
+                       |
+
+                       ▼
+
+
+          Generate Performance Report
+
+25. 示例输出
+================================================
+
+Model:
+
+Llama-7B
+
+
+Hardware:
+
+GPU + DRAM-PIM
+
+
+Mode:
+
+Decode
+
+
+================================================
+
+
+Total Latency:
+
+85 ms
+
+
+Breakdown:
+
+Compute:
+
+25 ms (29%)
+
+
+Memory:
+
+15 ms (18%)
+
+
+Transfer:
+
+40 ms (47%)
+
+
+Sync:
+
+5 ms (6%)
+
+
+
+Main Bottleneck:
+
+Communication Bound
+
+
+
+Top Cost Operator:
+
+
+1. Attention Layer20
+
+2. FFN Layer15
+
+
+Weight Residency:
+
+92%
+
+
+KV Cache Transfer:
+
+35GB
+
+
+================================================
+
+26. 该模块的科研价值
+
+完成后，模拟器不只是：
+
+“计算时间模拟器”。
+
+而是：
+
+一个用于解释LLM-PIM架构设计原因的分析工具。
+
+它可以回答：
+
+为什么某论文把FFN放PIM？
+
+↓
+
+因为：
+
+FFN Weight Transfer占比高。
+
+为什么某论文优化KV Cache？
+
+↓
+
+因为：
+
+Decode阶段KV访问成为主要瓶颈。
+
+为什么某架构增加片上Buffer？
+
+↓
+
+因为：
+
+减少Synchronization和Transfer。
+
+27. 当前整体设计完成度
+
+目前已经完成：
+
+模块	状态
+01 总体设计	✅
+02 硬件模型	✅
+03 数据模型	✅
+04 LLM算子模型	✅
+05 性能模型	✅
+06 Scheduler	✅
+07 软件架构	✅
+08 实验分析	✅

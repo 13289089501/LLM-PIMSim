@@ -1,0 +1,686 @@
+LLM-PIMSim 总体设计文档（v1.0）
+面向大语言模型推理架构探索的轻量级离散事件模拟器
+1. 项目概述
+1.1 项目名称
+
+LLM-PIMSim
+
+（原项目名称：WDNBLSSsim）
+
+全称：
+
+Lightweight Discrete-Event Simulator for LLM Inference Architecture Exploration
+
+中文：
+
+面向大语言模型推理架构探索的轻量级离散事件模拟器
+
+1.2 项目背景
+
+近年来，大语言模型（Large Language Model, LLM）规模快速增长，模型参数量从十亿级发展到千亿级甚至万亿级。
+
+以Transformer为核心架构的LLM推理过程具有以下特点：
+
+模型参数规模巨大
+
+例如：
+
+LLaMA-7B
+LLaMA-70B
+
+模型权重达到几十GB甚至数百GB。
+
+推理过程具有明显阶段差异
+
+LLM推理通常分为：
+
+Prefill阶段
+
+输入prompt一次性处理。
+
+特点：
+
+大矩阵乘
+高计算密度
+计算资源利用率较高
+Decode阶段
+
+逐token生成。
+
+特点：
+
+KV Cache持续增长
+权重重复访问
+数据移动占主要开销
+传统GPU架构受到Memory Wall限制
+
+虽然GPU拥有强大的计算能力，但是：
+
+权重搬运
+KV Cache访问
+内存带宽限制
+
+逐渐成为LLM推理性能瓶颈。
+
+1.3 PIM技术背景
+
+存内计算（Processing-In-Memory, PIM）通过将计算能力靠近存储单元，减少数据在：
+
+Memory
+    |
+    |
+Compute Unit
+
+之间的移动。
+
+典型PIM架构包括：
+
+DRAM-PIM
+
+特点：
+
+大容量
+高带宽
+权重驻留能力强
+
+适合：
+
+大规模模型权重存储
+大矩阵计算
+SRAM-PIM
+
+特点：
+
+高速访问
+低延迟
+容量较小
+
+适合：
+
+小规模高速计算
+延迟敏感任务
+ReRAM-PIM
+
+特点：
+
+模拟计算
+高并行度
+高能效
+
+限制：
+
+精度
+ADC/DAC开销
+写入速度
+1.4 项目提出原因
+
+目前阅读LLM-PIM相关论文时存在以下困难：
+
+不同论文提出不同架构：
+
+例如：
+
+将Attention放入PIM
+将FFN放入PIM
+将KV Cache放入PIM
+使用不同存储介质
+
+但是缺少一个统一分析工具回答：
+
+问题1：
+
+某个算子为什么适合PIM？
+
+例如：
+
+为什么Decode阶段比Prefill更适合PIM？
+
+问题2：
+
+LLM推理瓶颈来自哪里？
+
+是：
+
+计算不足？
+内存带宽不足？
+数据搬运？
+同步等待？
+问题3：
+
+不同PIM架构适合什么场景？
+
+例如：
+
+SRAM-PIM
+DRAM-PIM
+ReRAM-PIM
+
+因此设计：
+
+一个面向LLM-PIM体系结构探索的轻量级模拟器。
+
+2. 设计目标
+2.1 核心目标
+
+LLM-PIMSim的目标不是进行RTL级或者电路级精确模拟。
+
+而是：
+
+通过简化但具有体系结构意义的性能模型，快速分析LLM推理过程中计算、数据移动和同步之间的关系。
+
+2.2 模拟器主要功能
+
+系统需要支持：
+
+（1）LLM模型抽象
+
+支持：
+
+Transformer结构
+Layer级执行
+Prefill/Decode阶段
+（2）异构硬件建模
+
+支持：
+
+GPU
+DRAM-PIM
+SRAM-PIM
+ReRAM-PIM
+
+描述：
+
+计算能力
+存储容量
+带宽
+延迟
+支持精度
+（3）数据位置建模
+
+模拟：
+
+权重位置
+激活数据位置
+KV Cache位置
+
+支持：
+
+权重驻留
+数据迁移
+数据共享
+（4）算子性能估计
+
+通过性能模型计算：
+
+计算时间
+数据访问时间
+通信时间
+（5）任务调度模拟
+
+采用：
+
+基于性能模型的简化离散事件模拟
+
+模拟：
+
+数据依赖
+任务等待
+多设备并行
+同步开销
+（6）瓶颈分析
+
+输出：
+
+一次推理中：
+
+Compute %
+
+Memory Transfer %
+
+Memory Stall %
+
+Synchronization %
+
+Idle %
+
+帮助用户理解：
+
+系统性能瓶颈来源。
+
+3. 设计原则
+3.1 模型抽象原则
+
+系统采用：
+
+“高层体系结构模拟”
+
+而非：
+
+“底层硬件模拟”
+
+不模拟：
+
+transistor
+circuit
+RTL cycle
+cache coherence
+
+重点模拟：
+
+数据在哪里
+数据如何移动
+算子在哪里执行
+等待如何产生
+3.2 公式模型 + 离散事件模型结合
+
+LLM-PIMSim采用混合模拟方式。
+
+性能公式模型
+
+负责：
+
+计算一个任务需要多久
+
+例如：
+
+计算时间：
+
+T
+compute
+	​
+
+=
+PeakCompute×Efficiency
+FLOPs
+	​
+
+
+数据移动：
+
+T
+transfer
+	​
+
+=T
+read
+	​
+
++T
+network
+	​
+
++T
+write
+	​
+
+离散事件模型
+
+负责：
+
+一个任务什么时候可以开始
+
+考虑：
+
+数据是否ready
+硬件是否空闲
+是否需要等待同步
+3.3 数据驱动原则
+
+系统不采用：
+
+Operator → Operator
+
+简单连接。
+
+而采用：
+
+Operator
+
+↓
+
+Data Object
+
+↓
+
+Operator
+
+原因：
+
+LLM性能高度依赖：
+
+数据位置
+数据大小
+数据生命周期
+4. 系统总体架构
+
+系统整体结构：
+
+                 User Configuration
+
+                         |
+
+        --------------------------------
+
+        |                              |
+
+ Hardware Model                  LLM Model
+
+
+        |                              |
+
+        ----------- Data Model --------
+
+
+                         |
+
+              Performance Model
+
+
+                         |
+
+              Event Scheduler
+
+
+                         |
+
+             Bottleneck Analyzer
+
+
+                         |
+
+                   Result Report
+
+5. 模块组成
+
+系统包含以下核心模块：
+
+5.1 Hardware Model（硬件模型）
+
+作用：
+
+描述计算和存储资源。
+
+负责：
+
+GPU建模
+PIM建模
+存储能力
+计算能力
+精度支持
+
+输出：
+
+硬件能力描述。
+
+5.2 Data Model（数据模型）
+
+作用：
+
+管理所有数据对象。
+
+包括：
+
+Weight
+Activation
+KV Cache
+
+负责：
+
+数据大小
+数据位置
+数据状态
+5.3 Data Placement Model（数据放置模型）
+
+作用：
+
+决定：
+
+数据存在哪里。
+
+例如：
+
+Layer1 Weight
+
+→ GPU HBM
+
+
+Layer2 Weight
+
+→ DRAM-PIM
+
+影响：
+
+数据搬运时间
+权重驻留效果
+5.4 Operator Model（算子模型）
+
+作用：
+
+描述LLM计算任务。
+
+例如：
+
+Transformer Layer：
+
+QKV Projection
+
+Attention
+
+FFN
+
+LayerNorm
+
+每个算子包含：
+
+输入数据
+输出数据
+FLOPs
+精度要求
+可执行设备
+5.5 Performance Model（性能模型）
+
+作用：
+
+估算任务执行时间。
+
+包括：
+
+Compute Model
+
+计算时间。
+
+Memory Model
+
+数据访问时间。
+
+Transfer Model
+
+设备间数据移动。
+
+Synchronization Model
+
+同步等待。
+
+5.6 Event Scheduler（事件调度器）
+
+作用：
+
+模拟任务执行过程。
+
+负责：
+
+创建事件
+管理事件队列
+更新设备状态
+处理依赖关系
+5.7 Bottleneck Analyzer（瓶颈分析器）
+
+作用：
+
+分析性能来源。
+
+输出：
+
+例如：
+
+Total latency:
+
+Compute:
+35%
+
+Memory:
+45%
+
+Transfer:
+15%
+
+Sync:
+5%
+6. 系统运行流程
+
+一次模拟流程：
+
+Step 1：加载配置
+
+用户输入：
+
+Hardware configuration
+Model configuration
+Placement configuration
+Step 2：生成LLM计算图
+
+例如：
+
+Transformer Layer
+
+↓
+
+QKV
+
+↓
+
+Attention
+
+↓
+
+FFN
+
+↓
+
+Output
+Step 3：初始化数据状态
+
+例如：
+
+Weight:
+
+Location = DRAM-PIM
+
+
+KV Cache:
+
+Location = HBM
+Step 4：任务调度
+
+Scheduler检查：
+
+数据是否准备完成
+硬件是否空闲
+精度是否匹配
+Step 5：性能计算
+
+计算：
+
+执行时间
+数据搬运时间
+Step 6：生成事件
+
+例如：
+
+FFN finished
+
+time=5ms
+
+加入事件队列。
+
+Step 7：更新状态
+
+更新：
+
+数据ready时间
+硬件available时间
+
+继续执行。
+
+7. 输出结果
+
+系统最终输出：
+
+性能结果
+
+包括：
+
+Total latency
+Token latency
+Throughput
+资源利用率
+
+包括：
+
+GPU utilization
+PIM utilization
+Memory utilization
+瓶颈分析
+
+包括：
+
+Compute bound
+Memory bound
+Transfer bound
+Synchronization bound
+数据移动分析
+
+例如：
+
+Weight movement:
+
+GPU → DRAM-PIM
+
+200GB
+
+Time:
+
+3.5ms
+8. 第一阶段实现范围
+
+第一版本目标：
+
+实现：
+
+✅ GPU模型
+✅ DRAM-PIM模型
+✅ SRAM-PIM模型
+✅ ReRAM-PIM简单模型
+✅ Transformer Layer模拟
+✅ Prefill/Decode模拟
+✅ 数据依赖调度
+✅ 数据搬运模拟
+✅ KV Cache增长模拟
+
+暂不实现：
+
+❌ 电路级PIM模型
+❌ ADC/DAC详细模拟
+❌ 精确功耗模型
+❌ RTL级模拟
+❌ 真实GPU架构模拟
+
+9. 项目最终定位
+
+LLM-PIMSim不是一个芯片验证工具。
+
+它定位为：
+
+一个帮助研究者理解LLM推理瓶颈、探索PIM架构设计选择的轻量级体系结构模拟平台。
+
+——总体设计文档结束——

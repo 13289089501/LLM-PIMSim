@@ -1,0 +1,1533 @@
+下面继续。这里我会把计算、片上/本地存储访问、设备间数据搬运、数据依赖等待统一到一个性能模型中。需要特别注意：这一份实际上是整个 Sim 的“物理规律层”，后面的调度器只是按照这些规律安排事件，而不是自己计算性能。
+
+《05_性能模型设计文档》
+
+项目：LLM-PIMSim
+模块：Performance Model（性能模型模块）
+版本：v1.0
+
+1. 模块概述
+1.1 模块目的
+
+Performance Model负责根据：
+
+Operator
+Hardware
+Data
+Interconnect
+
+等信息，估算一个任务的执行时间。
+
+它不负责决定：
+
+“什么时候执行”。
+
+而负责回答：
+
+“如果在这个硬件上执行，这个任务需要多长时间？”
+
+1.2 性能模型的核心思想
+
+LLM-PIMSim不采用单一公式：
+
+T=
+Peak Compute
+FLOPs
+	​
+
+
+因为这会严重高估真实性能。
+
+一个算子的实际延迟至少受到以下因素影响：
+
+Operator
+   │
+   ├── Compute
+   │
+   ├── Local Memory Access
+   │
+   ├── Inter-device Transfer
+   │
+   └── Data Dependency
+
+因此系统采用：
+
+计算模型 + 存储访问模型 + 数据搬运模型 + 调度等待模型
+
+共同构成最终性能。
+
+2. 性能模型与调度模型的边界
+
+这是必须明确的。
+
+Performance Model负责
+算子执行多久？
+
+数据读取多久？
+
+数据写入多久？
+
+设备间传输多久？
+Scheduler负责
+算子什么时候可以开始？
+
+需要等待哪些数据？
+
+需要等待哪个硬件？
+
+多个依赖什么时候全部完成？
+
+因此：
+
+Performance Model→Duration
+
+而：
+
+Scheduler→Start/End Time
+3. 总体延迟模型
+
+对于一个Operator：
+
+T
+operator
+	​
+
+
+可以分解为：
+
+T
+operator
+	​
+
+=T
+compute
+	​
+
++T
+local_memory
+	​
+
++T
+transfer
+	​
+
+
+但是这里需要进行一个重要修正：
+
+这三个时间不一定在真实硬件上严格串行。
+
+例如计算和数据访问可能存在重叠。
+
+因此第一版定义两种模式：
+
+简化模式
+
+串行：
+
+T=T
+compute
+	​
+
++T
+memory
+	​
+
++T
+transfer
+	​
+
+Overlap模式
+
+考虑计算和数据访问重叠：
+
+T=max(T
+compute
+	​
+
+,T
+memory
+	​
+
++T
+transfer
+	​
+
+)
+
+第一版默认使用简化模式，后续再增加Overlap。
+
+这样可以避免第一版模型过于复杂。
+
+4. Compute Model
+4.1 基本公式
+
+计算时间：
+
+T
+compute
+	​
+
+=
+PeakCompute×Efficiency
+FLOPs
+	​
+
+	​
+
+
+其中：
+
+FLOPs：算子计算量
+PeakCompute：硬件峰值计算能力
+Efficiency：该算子在该硬件上的有效利用率
+5. 为什么必须加入Efficiency
+
+例如：
+
+GPU峰值：
+
+1000 TOPS
+
+某个GEMM：
+
+Efficiency=0.8
+
+实际有效计算能力：
+
+1000×0.8=800 TOPS
+
+因此：
+
+T=
+800TOPS
+FLOPs
+	​
+
+6. Efficiency的来源
+
+Efficiency不是固定常数。
+
+定义：
+
+E=f(H,O,S,P)
+
+其中：
+
+H：Hardware
+O：Operator
+S：Problem Size
+P：Precision
+
+第一版可以简化为：
+
+E=f(H,O)
+
+即：
+
+不同硬件 + 不同算子拥有不同效率。
+
+7. Efficiency配置
+
+例如：
+
+{
+    "GPU": {
+        "GEMM": 0.85,
+        "Attention": 0.60,
+        "Softmax": 0.30,
+        "LayerNorm": 0.25
+    },
+
+    "DRAM_PIM": {
+        "GEMM": 0.70,
+        "Attention": 0.40,
+        "Softmax": 0.20
+    }
+}
+8. Compute Capacity与Precision
+
+Hardware Model提供：
+
+Peak Compute
+Supported Precision
+
+Operator提供：
+
+Required Precision
+
+如果不兼容：
+
+T
+compute
+	​
+
+=∞
+
+也就是：
+
+该Hardware不能执行该Operator。
+
+Scheduler应直接禁止该映射。
+
+9. Precision对性能的影响
+
+第一版中：
+
+Precision主要承担：
+
+能力约束
+
+而不是复杂的精度性能模型。
+
+例如：
+
+HIGH Operator
+
+LOW Hardware
+
+直接：
+
+Unsupported
+
+未来可以扩展：
+
+FP16 Peak Compute
+INT8 Peak Compute
+INT4 Peak Compute
+
+例如：
+
+PeakCompute(P)
+
+这样就能模拟：
+
+低精度不仅能执行，而且执行速度更快。
+
+但这不属于第一版必须实现的功能。
+
+10. Local Memory Model
+
+本地存储访问分成：
+
+Read
+Write
+
+不能合并。
+
+10.1 Read模型
+T
+read
+	​
+
+=L
+read
+	​
+
++
+BW
+read
+	​
+
+D
+	​
+
+	​
+
+
+其中：
+
+D：读取数据量
+BW
+read
+	​
+
+：读取带宽
+L
+read
+	​
+
+：读取固定延迟
+10.2 Write模型
+T
+write
+	​
+
+=L
+write
+	​
+
++
+BW
+write
+	​
+
+D
+	​
+
+	​
+
+11. 为什么需要Read/Write分开
+
+因为PIM尤其不能简单假设：
+
+BW
+read
+	​
+
+=BW
+write
+	​
+
+
+例如：
+
+DRAM-PIM
+
+Read:
+高带宽
+
+Write:
+相对较低
+
+甚至ReRAM等器件中：
+
+写操作可能具有完全不同的时间特性。
+
+因此配置文件必须分别记录。
+
+12. Operator的Memory Access
+
+每个Operator需要知道：
+
+Input Read Size
+
+Output Write Size
+
+例如GEMM：
+
+A:
+
+Read
+
+
+B:
+
+Read
+
+
+C:
+
+Write
+
+因此：
+
+T
+memory
+	​
+
+=T
+read
+	​
+
+(A)+T
+read
+	​
+
+(B)+T
+write
+	​
+
+(C)
+
+第一版采用这种显式模型。
+
+13. 数据是否真的需要读取？
+
+这是非常重要的一点。
+
+不能看到Operator有Input，就默认产生完整Memory Read。
+
+例如：
+
+Weight:
+
+已经驻留在PIM计算模块
+
+那么：
+
+Weight Residency = YES
+
+对应：
+
+T
+weight_transfer
+	​
+
+=0
+
+但是这里要区分：
+
+权重不需要跨设备搬运 ≠ 完全没有本地访问。
+
+如果PIM计算本身仍然需要访问本地存储中的权重，那么本地Memory Access是否计入，需要由硬件模型定义。
+
+第一版建议：
+
+对普通计算模块
+
+计入本地Memory Read。
+
+对“权重驻留并直接参与PIM计算”的抽象
+
+允许配置为：
+
+weight_access_mode = COMPUTE_IN_MEMORY
+
+此时不再额外计算传统：
+
+Memory → Compute
+
+的数据搬运。
+
+14. Inter-device Transfer Model
+
+设备之间的数据移动：
+
+A→B
+
+分成三个阶段：
+
+Source Read
+
+      +
+
+Interconnect Transfer
+
+      +
+
+Destination Write
+15. Source Read
+T
+source
+	​
+
+=L
+read
+	​
+
+(A)+
+BW
+read
+	​
+
+(A)
+D
+	​
+
+16. Interconnect Transfer
+T
+link
+	​
+
+=L
+link
+	​
+
+(A,B)+
+BW
+link
+	​
+
+(A,B)
+D
+	​
+
+17. Destination Write
+T
+destination
+	​
+
+=L
+write
+	​
+
+(B)+
+BW
+write
+	​
+
+(B)
+D
+	​
+
+18. 完整数据搬运公式
+
+最终：
+
+T
+transfer
+	​
+
+(A,B,D)=L
+read
+	​
+
+(A)+
+BW
+read
+	​
+
+(A)
+D
+	​
+
++L
+link
+	​
+
+(A,B)+
+BW
+link
+	​
+
+(A,B)
+D
+	​
+
++L
+write
+	​
+
+(B)+
+BW
+write
+	​
+
+(B)
+D
+	​
+
+	​
+
+
+这是当前模拟器的数据搬运核心公式。
+
+19. 一个具体例子
+
+假设：
+
+DRAM-PIM → GPU
+
+数据：
+
+D=1GB
+
+DRAM-PIM：
+
+Read BW = 500 GB/s
+Read Latency = 50 ns
+
+Link：
+
+BW = 100 GB/s
+Latency = 500 ns
+
+GPU：
+
+Write BW = 1000 GB/s
+Write Latency = 100 ns
+
+则：
+
+T
+transfer
+	​
+
+=50ns+
+500GB/s
+1GB
+	​
+
++500ns+
+100GB/s
+1GB
+	​
+
++100ns+
+1000GB/s
+1GB
+	​
+
+
+大约：
+
+=50ns+2ms+500ns+10ms+100ns+1ms
+
+因此：
+
+T
+transfer
+	​
+
+≈13ms
+
+这里可以非常直观地看到：
+
+真正的主要开销可能并不是设备读写，而是Interconnect带宽。
+
+20. Weight Residency模型
+
+Weight Residency不是一个单独的性能公式。
+
+它实际上是：
+
+Data Placement + Hardware Mapping
+
+共同产生的状态。
+
+判断：
+
+Weight Location
+        ==
+Operator Compute Location
+
+则：
+
+Weight Residency = TRUE
+
+否则：
+
+Weight Residency = FALSE
+21. Weight Residency的性能意义
+
+例如：
+
+GPU执行FFN
+
+Weight：
+
+DRAM-PIM
+
+那么：
+
+DRAM-PIM
+     |
+     | Transfer
+     ↓
+GPU
+
+需要搬运。
+
+PIM执行FFN
+
+Weight：
+
+DRAM-PIM
+
+Compute：
+
+DRAM-PIM
+
+则：
+
+Weight Residency = TRUE
+
+避免跨设备Weight Transfer。
+
+22. 数据依赖等待时间
+
+这是性能模型与Scheduler之间非常重要的接口。
+
+假设：
+
+Operator A
+   |
+   | produces
+   ↓
+Data X
+   |
+   ↓
+Operator B
+
+如果：
+
+ReadyTime(X)=10ms
+
+而B所在Hardware：
+
+AvailableTime=5ms
+
+则B最早开始时间：
+
+Start(B)=10ms
+
+因此：
+
+T
+dependency wait
+	​
+
+=10−5=5ms
+23. 多数据依赖模型
+
+这就是你之前提出的：
+
+Softmax需要全局矩阵数据，如果这份数据需要四个计算模块计算，则需要等待四份数据。
+
+这个思想非常重要。
+
+假设：
+
+Data A → Compute Module 1
+Data B → Compute Module 2
+Data C → Compute Module 3
+Data D → Compute Module 4
+
+Softmax：
+
+requires:
+
+A
+B
+C
+D
+
+如果四份数据ready时间：
+
+A = 5ms
+B = 8ms
+C = 7ms
+D = 12ms
+
+则：
+
+Ready
+Softmax
+	​
+
+=max(5,8,7,12)=12ms
+
+所以：
+
+Softmax必须等待最慢的依赖。
+
+24. 多模块结果合并
+
+因此，Data Dependency Model实际上会自然产生：
+
+T
+wait
+	​
+
+=max(T
+1
+	​
+
+,T
+2
+	​
+
+,⋯,T
+n
+	​
+
+)−T
+current
+	​
+
+
+这比简单的：
+
+Operator A → Operator B
+
+更加符合真实LLM硬件执行过程。
+
+25. KV Cache访问模型
+
+KV Cache是本模拟器的重要特殊对象。
+
+Decode阶段：
+
+Q
+
++
+
+KV Cache
+
+↓
+
+Attention
+
+随着token数量增加：
+
+KVSize∝SequenceLength
+26. KV Cache Memory Cost
+
+假设：
+
+Layer数：L
+Sequence Length：S
+Hidden Size：H
+Precision Size：P
+
+简化模型：
+
+KVSize=2×L×S×H×P
+
+这里的2代表：
+
+K + V
+27. KV Cache访问时间
+
+如果KV Cache与Attention Compute在不同设备：
+
+需要：
+
+T
+KV
+	​
+
+=T
+transfer
+	​
+
+
+如果KV Cache驻留在计算设备：
+
+则不需要跨设备迁移。
+
+但仍可能存在：
+
+Local Memory Access
+28. Compute Bound与Memory Bound
+
+这是这个模拟器最终最希望回答的问题之一。
+
+28.1 Compute Time
+
+定义：
+
+T
+C
+	​
+
+=T
+compute
+	​
+
+28.2 Memory/Transfer Time
+
+定义：
+
+T
+M
+	​
+
+=T
+local memory
+	​
+
++T
+transfer
+	​
+
+29. 第一版瓶颈分类
+
+如果：
+
+T
+C
+	​
+
+>T
+M
+	​
+
+
+定义：
+
+Compute Bound
+
+如果：
+
+T
+M
+	​
+
+>T
+C
+	​
+
+
+定义：
+
+Memory/Communication Bound
+
+但这里建议进一步细分。
+
+30. 三类瓶颈
+Compute Bound
+T
+C
+	​
+
+>T
+Memory
+	​
+
+Memory Bound
+T
+LocalMemory
+	​
+
+>T
+C
+	​
+
+Communication Bound
+T
+Transfer
+	​
+
+>T
+C
+	​
+
+
+这样才能真正分析PIM收益。
+
+31. 为什么必须区分Memory和Communication
+
+例如：
+
+GPU内部
+HBM bandwidth不足
+
+属于：
+
+Memory Bound
+
+GPU ↔ PIM
+PCIe / NoC bandwidth不足
+
+属于：
+
+Communication Bound
+
+二者虽然都属于“数据相关瓶颈”，但架构优化方向完全不同。
+
+32. Synchronization Bound
+
+还需要加入第四种：
+
+Synchronization Bound
+
+例如：
+
+四个模块分别计算：
+
+A = 2ms
+B = 3ms
+C = 3ms
+D = 10ms
+
+最终算子必须等D。
+
+那么：
+
+A/B/C
+
+finished
+
+but cannot continue
+
+产生：
+
+T
+sync
+	​
+
+33. 最终性能组成
+
+第一版报告可以将总延迟拆解为：
+
+T
+total
+	​
+
+=T
+compute
+	​
+
++T
+local memory
+	​
+
++T
+transfer
+	​
+
++T
+synchronization
+	​
+
+	​
+
+
+但这里仍然强调：
+
+这是分析意义上的时间分解，不意味着所有时间在硬件中严格串行发生。
+
+34. 第二阶段：Overlap模型
+
+未来支持：
+
+Compute
+
+        ┌───────────────┐
+        │               │
+        ▼               │
+Memory → Compute        │
+        │               │
+        └───────────────┘
+
+例如：
+
+T=max(T
+C
+	​
+
+,T
+M
+	​
+
+)
+
+而不是：
+
+T=T
+C
+	​
+
++T
+M
+	​
+
+35. 第一版为什么暂时不做Overlap
+
+因为Overlap需要额外描述：
+
+DMA资源
+Compute Resource
+Buffer
+Pipeline
+Double Buffering
+
+如果现在直接加入：
+
+调度器复杂度会大幅增加。
+
+因此第一版：
+
+先保证模型正确、可解释、可扩展。
+
+36. Performance Model输入
+
+Performance Model主要接收：
+
+Operator
+Hardware
+Data
+Interconnect
+37. Performance Model输出
+
+对于一个任务：
+
+PerformanceResult
+
+包含：
+
+compute_time
+
+local_read_time
+
+local_write_time
+
+transfer_time
+
+total_execution_time
+
+bottleneck_type
+38. 示例
+
+例如：
+
+Operator:
+
+FFN Layer 3
+
+运行：
+
+DRAM-PIM
+
+结果：
+
+Compute:
+
+2.0 ms
+
+
+Local Memory:
+
+0.8 ms
+
+
+Transfer:
+
+0 ms
+
+
+Total:
+
+2.8 ms
+
+
+Bottleneck:
+
+Compute Bound
+
+另一个情况：
+
+FFN:
+
+GPU
+
+Weight：
+
+DRAM-PIM
+
+可能得到：
+
+Compute:
+
+2.0 ms
+
+Weight Transfer:
+
+8.0 ms
+
+Local Memory:
+
+1.0 ms
+
+Total:
+
+11 ms
+
+Bottleneck:
+
+Communication Bound
+
+这正是我们希望模拟器最终能够直观展示的结果。
+
+39. 与Scheduler的接口
+
+Performance Model：
+
+estimate(operator, hardware)
+
+返回：
+
+duration
+
+Scheduler：
+
+start_time
+=
+max(
+    hardware_available,
+    dependency_ready,
+    transfer_ready
+)
+
+然后：
+
+end_time
+=
+start_time
++
+duration
+40. 一个完整事件例子
+
+假设：
+
+FFN Weight:
+
+DRAM-PIM
+
+
+FFN Compute:
+
+GPU
+
+Scheduler发现：
+
+Weight location != GPU
+
+首先创建：
+
+Transfer Event
+
+Performance Model计算：
+
+Ttransfer=8ms
+
+因此：
+
+Weight Ready:
+
+8ms
+
+之后：
+
+FFN：
+
+Tcompute=2ms
+
+于是：
+
+FFN Start=8ms
+
+FFN End=10ms
+41. 性能模型配置原则
+
+不要把公式写死。
+
+例如：
+
+不要：
+
+if operator == "GEMM":
+    time = ...
+
+而应该：
+
+Operator
+    ↓
+Performance Model
+    ↓
+Operator-specific Performance Function
+
+这样以后增加：
+
+MoE
+FlashAttention
+Quantized GEMM
+
+不需要修改整个模拟器。
+
+42. 第一版必须实现
+Compute
+FLOPs
+Peak Compute
+Efficiency
+Memory
+Read Latency
+Write Latency
+Read Bandwidth
+Write Bandwidth
+Transfer
+Source Read
+Link Transfer
+Destination Write
+Dependency
+Data Ready Time
+Multi-input synchronization
+Bottleneck
+Compute
+Memory
+Communication
+Synchronization
+43. 第一版暂不实现
+
+暂不实现：
+
+Cache hierarchy
+DMA详细模型
+Compute/Memory overlap
+Pipeline
+Prefetch
+Compression
+Dynamic frequency scaling
+Power model
+Thermal model
+44. 最终模型结构
+                  Operator
+                     │
+                     ▼
+             ┌───────────────┐
+             │ Performance   │
+             │ Model         │
+             └───────────────┘
+                │     │
+       ┌────────┘     └────────┐
+       ▼                       ▼
+ Compute Model             Memory Model
+       │                       │
+       │                  ┌────┴────┐
+       │                  ▼         ▼
+       │                Read      Write
+       │
+       └────────────┬──────────────┘
+                    ▼
+             Transfer Model
+                    │
+             ┌──────┴──────┐
+             ▼             ▼
+          Source         Destination
+           Read            Write
+                    │
+                    ▼
+              Duration
+45. 核心公式汇总
+Compute
+T
+C
+	​
+
+=
+PeakCompute×Efficiency
+FLOPs
+	​
+
+	​
+
+Local Read
+T
+R
+	​
+
+=L
+R
+	​
+
++
+BW
+R
+	​
+
+D
+	​
+
+	​
+
+Local Write
+T
+W
+	​
+
+=L
+W
+	​
+
++
+BW
+W
+	​
+
+D
+	​
+
+	​
+
+Interconnect
+T
+L
+	​
+
+=L
+L
+	​
+
++
+BW
+L
+	​
+
+D
+	​
+
+	​
+
+Device Transfer
+T
+Transfer
+	​
+
+=T
+R
+	​
+
+(A)+T
+L
+	​
+
+(A,B)+T
+W
+	​
+
+(B)
+	​
+
+Dependency
+T
+ready
+	​
+
+=max(T
+data1
+	​
+
+,T
+data2
+	​
+
+,...,T
+dataN
+	​
+
+)
+	​
+
+46. 一个需要特别保留的设计决策
+
+目前我们的模型实际上已经形成了一个非常重要的体系：
+
+                 "算得多快"
+                      │
+                      ▼
+                Compute Model
+
+
+"本地数据访问多快" ──→ Memory Model
+
+
+"数据跨设备移动多快" → Transfer Model
+
+
+"为什么不能马上算" ──→ Dependency Model
+
+
+"什么时候真正执行" ──→ Scheduler
+
+这几个概念必须保持独立。
+
+否则以后分析PIM论文时，很容易把：
+
+计算瓶颈、内存带宽瓶颈、互连带宽瓶颈、同步等待
+
+混成一个“Memory Bound”。
+
+而这恰恰会削弱这个模拟器的研究价值。
+
+——《05_性能模型设计文档》结束——

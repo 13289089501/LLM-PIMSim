@@ -1,0 +1,17 @@
+# hardware_gpu.yaml — GPU-only 实验专用：只有一块 GPU，没有 PIM
+devices:
+  - id: gpu0
+    type: GPU
+    compute:
+      peak_tflops: 300
+    efficiency:
+      GEMM: 0.85
+      Attention: 0.60
+      Softmax: 0.30
+      LayerNorm: 0.25
+    memory:
+      capacity_gb: 80
+      read_bandwidth_gbs: 2000
+      write_bandwidth_gbs: 1800
+      read_latency_ns: 100
+      write_latency_ns: 100

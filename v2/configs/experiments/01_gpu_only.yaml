@@ -1,0 +1,12 @@
+# 01_gpu_only.yaml — GPU-only 基线（只有一块 GPU，所有权重/数据放 GPU）
+experiment:
+  name: 01_gpu_only
+  model: llama7b
+  seed: 42
+  files:
+    hardware: hardware_gpu.yaml
+    interconnect: interconnect_gpu.yaml
+    mapping: mapping_gpu.yaml
+    placement: placement_gpu.yaml
+  output:
+    dir: results/

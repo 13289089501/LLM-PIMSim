@@ -1,0 +1,7 @@
+devices:
+  - id: my-device
+    type: CPU
+    compute:
+      peak_tflops: 300
+    memory:
+      capacity_gb: 80
