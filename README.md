@@ -2,6 +2,43 @@
 
 > An architecture-level discrete-event simulator for analyzing LLM inference acceleration with Processing-In-Memory (PIM) and heterogeneous computing architectures.
 
+---
+
+## 版本与快速开始
+
+本仓库包含两代实现：
+
+| 版本 | 目录 | 说明 |
+|---|---|---|
+| **v3（最新·推荐）** | `v3/` | 八大系统解耦（精度/硬件/算子/权重/切割/校验/输出/调度）+ 前后端打通 + GUI + IC 参考实验，可直接运行 |
+| v2 | `v2/` | 早期配置驱动实现（供参考历史） |
+| v1 | `/v1` | 最早原型（已不进仓库） |
+
+### 快速开始（v3）
+
+```bash
+cd v3
+pip install -r requirements.txt     # flask + pyyaml
+
+# 方式 A：命令行（跑内置 IC 参考实验）
+python run.py configs/experiments/04_ic_reference.yaml
+
+# 方式 B：图形界面（拖拽拓扑编辑器 + 实时校验 + 依赖图 + 关键路径）
+python gui_app.py                    # 打开 http://127.0.0.1:5000
+```
+
+v3 详细文档见 [`v3/README.md`](v3/README.md) 与 [`v3/CHANGELOG_v3.md`](v3/CHANGELOG_v3.md)。
+
+### v3 核心特性
+
+- **八大系统解耦**：`core/` 下按 精度 / 硬件 / 算子 / 权重 / 切割 / 校验 / 输出 / 调度 单向依赖。
+- **配置驱动**：硬件/互连/映射/放置 全由 YAML 描述，另提供一键 `04_ic_reference` 参考部署。
+- **张量并行切片**：`workload.splits` 支持按维度切分 + 权重分片式多设备并行（ALL-GATHER）。
+- **校验充分性**：校验通过即可完整运行，校验不过则拒绝运行（前后端同一套判定）。
+- **GUI**：拖拽部署、层折叠、依赖图 DAG、关键路径视图、结果对比、初学者友好提示。
+
+---
+
 [English](#english) | [中文](#中文)
 
 ---
@@ -915,7 +952,7 @@ LLM-PIMSim 是一个架构级研究工具。
 
 ## 20. License
 
-License 信息将在正式开源时确定。
+本项目采用 **MIT License** 发布，详见 `v3/LICENSE`。可自由使用、修改、分发（含商用），需保留版权与许可证声明。
 
 ---
 
@@ -963,9 +1000,7 @@ The central question is:
 
 ### Project Status
 
-🚧 **Under active architecture design and MVP preparation.**
-
-The current project focus is establishing a clean, extensible simulation architecture before implementing the complete simulator.
+✅ **v3 is released** — a full implementation with eight decoupled core systems, GUI, and an IC reference experiment. See the Chinese quick-start above and `v3/README.md`.
 
 ### Architecture
 
@@ -995,8 +1030,8 @@ See the Chinese documentation above for the current detailed design.
 
 ## License
 
-To be determined.
+本项目采用 **MIT License** 发布。
 
 ## Citation
 
-Citation information will be finalized after the first public release.
+Citation 信息将在正式发布后补充。
