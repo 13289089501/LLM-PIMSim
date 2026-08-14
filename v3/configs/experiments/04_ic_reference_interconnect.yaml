@@ -1,0 +1,27 @@
+# 04_ic_reference_interconnect.yaml — IC 参考互连（全连通，保证任意设备间数据可达）
+links:
+  - src: gpu0
+    dst: pim0
+    read_bandwidth_gbs: 120
+    write_bandwidth_gbs: 80
+    latency_ns: 500
+  - src: gpu0
+    dst: sram0
+    read_bandwidth_gbs: 200
+    write_bandwidth_gbs: 200
+    latency_ns: 100
+  - src: gpu0
+    dst: rram0
+    read_bandwidth_gbs: 120
+    write_bandwidth_gbs: 80
+    latency_ns: 500
+  - src: pim0
+    dst: sram0
+    read_bandwidth_gbs: 150
+    write_bandwidth_gbs: 100
+    latency_ns: 200
+  - src: sram0
+    dst: rram0
+    read_bandwidth_gbs: 150
+    write_bandwidth_gbs: 100
+    latency_ns: 200

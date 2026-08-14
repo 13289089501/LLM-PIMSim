@@ -1,0 +1,73 @@
+精度系统功能核查和修改意见
+精度系统应该具有如下功能
+1、能够帮助用户分析LLM推理的瓶颈在哪里，给出一定建议
+2、以算子展开能够展现各个算子花费的时间，以及这些时间包括哪些种类（关联调度系统的建模）
+
+修改意见
+1、现在的输出系统太过简略，应该按照上述方法进行丰富。
+
+=== agent回答 ===
+【现状核查】
+当前输出系统（core/exporter.py）产出的结果包含：
+- 顶层：total_latency_ns/ms、breakdown（compute/transfer/sync/local_rw 四类）、bottleneck + rationale、operator_timings（每算子 start/end/duration/compute/transfer）、event_trace（离散事件序列）、movement_bytes（搬运量明细 per_link）、data_source_notes（数据源决策）、diagnostics（完成度/未完成算子）。
+
+即"瓶颈类型 + 全局分解 + 逐算子时间线 + 事件轨迹 + 搬运量 + 完成度"其实已经具备，但确实偏"数字罗列"，缺"可读的分析与建议"。
+
+【针对两条目标/意见的回答】
+
+1) 帮助用户分析 LLM 推理瓶颈 + 给出建议：
+   - 现状：只给 bottleneck 枚举（COMPUTE/COMMUNICATION/SYNCHRONIZATION/MEMORY）+ rationale 一句话。
+   - 建议丰化（属于输出系统的纯后端改造）：
+     a) 瓶颈归因细化：按"累加计算耗时最高的算子/设备"给出 Top-K，例如"Lx_ffn_down 占了总体计算 12%，在 pim0 上算力利用最低"。
+     b) 给出设备/维度视图：按设备聚合 compute/transfer/sync，指出哪个设备是热点。
+     c) 生成可读的"建议文本"：比如"总延迟主要受 ff n 计算拖累，可考虑：换更高算力设备 / 加大并行度 / 把权重切分到更多片以分散搬运"。建议规则可用简单启发式（瓶颈是 COMMUNICATION 就建议就近布置/冗余放置；是 COMPUTE 就建议换设备或提高效率；有未完成算子就提示检查映射）。
+   - 这些都能在 exporter 新增一个 build_analysis(result) 函数实现，不改调度内核。
+
+2) 以算子展开、展现每算子耗时及构成（关联调度系统）：
+   - 现状：operator_timings 已有每算子耗时（compute/transfer/sync 分解），但没算"占比"、没按算子类型/层归类、没形成可读表格/文本。
+   - 建议丰化：
+     a) 每个算子条目补充：占比（占总延迟 %）、其 compute/transfer/sync 各自占比。
+     b) 按"层×算子类型"透视：汇总每层、每类算子的总耗时（方便看 attention 链 vs ffn 链）。
+     c) 区分"耗时种类"明确与调度系统的对应：compute=在该设备上执行时长（FLOPs/峰值/效率）；transfer=为拿到输入而发生的跨设备搬运（性能模型 transfer_time_ns）；sync=资源/数据就绪等待（max_arrival 超对齐的那段）。本地读写(local_rw)目前在 breakdown 有但算子级没单独记，建议在每算子补充 read/write 本地读写耗时。
+   - 建议新增输出：result['analysis'] = {bottleneck_tips, top_ops, per_device, per_op_type, per_layer}，纯新增字段，不破坏现有字段（向后兼容）。
+
+—— 待确认 ——
+- 你是想要"文本化建议（自然语言）"还是"可读表格/JSON 结构"，还是两者都要？这决定 build_analysis 的输出形态。
+- 本地读写(local_rw)是否要计入算子级详细分解？如果要，需要先让调度器在算子计时里单独累加 local_read/local_write（目前 scheduler 只在 transfer 里处理），这属于"先扩调度、再扩输出"的小改动。
+- 完成度诊断是否要作为 ERROR 冒泡（阻止"成功"态）还是仅 WARNING？建议接入校验系统协商。
+
+=== 新增待办：关键路径归因（来自调度系统 doc 改进点 1，已确认接受） ===
+- 目标：在结果里展示"决定总延时的关键路径"——从输入到最终输出耗时最长的那串阻塞链，
+  并标出每个节点耗时构成（compute/transfer/sync），让用户一眼看到"卡在哪条链"。
+- 数据基础：调度跑完后，operator_timings 有每算子 start/end/各分量；依赖关系可从
+  DataObject 的 producer_op/consumers 还原。
+- 实现归属：输出系统 core/exporter 新增 build_critical_path(result) → 返回关键路径算子序列
+  （含各自 start/end/构成/占比），并入 result['analysis']。
+- 依赖：需大致知道"某算子 end 是由哪个输入/设备牵制"（当前调度没有显式记录"等待哪个输入/
+  sync 由谁造成"）。建议在输出系统实现时，用"最晚到达的输入 + 是否等设备"近似还原谁是瓶颈牵制，
+  或后续调度系统在算子计时里记录"牵制源"。此依赖项一并记给调度系统。
+- 前端：已同步登记到 前端系统.txt（需求5：关键路径视图）。
+
+=== 完成度诊断接入校验系统（已完成实现，见下） ===
+- 背景：完成度诊断（diagnostics.finished/total/unfinished）是运行后才有的结果；用户要求
+  "完成度不过校验不许跑"。由于完成度需跑完才知道，采用完整方案：
+  1) 运行前静态预检：validator 对"确定性根本跑不完"的配置提前拦截（复用 A/B/D/E/W1 规则，
+     并新增数据可达闭包预检）。
+  2) 运行后完成度校验：core/validator 新增 validate_completion(result) —— 若 finished < total，
+     返回 error + 未完成算子清单；由 experiment_runner 在运行后调用，不通过则把结果标记为
+     "完成校验未通过"（不可当作有效方案/不可用于对比），GUI/CLI 均告警。
+- 状态：本轮实现。代码：core/validator.py、experiment_runner.py、gui_app.py。
+
+=== 本地读写纳入 + 关键路径归因 + 初学者友好（已实现，见下）===
+- 【本地读写纳入】✅ 已完成
+  - scheduler 在算子计时里真正累加 local_read_ns（输入在本地读）+ local_write_ns（写输出到本地）；
+  - DurationBreakdown 纳入 local_read/local_write；结果 breakdown 与算子级 op_timings 都带；
+  - 瓶颈判定 MEMORY 也纳入本地读写总量（但通常仍然 COMPUTE 主导）。
+- 【关键路径归因】✅ 已完成（core/exporter.build_critical_path）
+  - 基于 operator_timings 的"时间主链"近似：从最晚结束算子往前回溯"最晚前驱"，输出关键算子序列
+    + 每节点构成 + 人话解释；随 result['analysis']['critical_path'] 返回；GUI /api/run 也返回。
+  - 严格版（需依赖图）待调度器记录"牵制源"后增强，见下方"前端待办/遗留"。
+- 【初学者友好文字/图标】✅ 已完成（gui_app 结果面板）
+  - 前端结果面板已加图标（⏱⚙🔁💾🔎✂📊）+ _friendlyTip 人话瓶颈提示；
+  - 关键路径已在结果面板显示（_criticalPathHtml 消费 /api/run 的 critical_path）。
+- 回归：全部测试与实验通过。

@@ -1,0 +1,71 @@
+# 04_ic_reference_mapping.yaml — IC 参考部署：每个算子放哪个设备
+# 集成电路视角决策依据：
+#   - GPU 通用算力强（A100 类）→ 承担 attention 链 GEMM + 全部 FP32 非线性(LAYERNORM/Softmax/RoPE)
+#   - DRAM-PIM 就近大权重 → FFN 的三个 GEMM（权重最大化，PIM 收益来源）
+#   - SRAM-PIM 高带宽 + 支持 FP16 执行 → 放 SiLU / Residual 这类逐元素低访存算子
+#   - ReRAM-PIM 支持 FP8 执行 → 放词表 LMHead
+# 注意：must 能通过"运行前校验(A3)"——算子 placed 到的设备必须在其能力表(categories/execution)内。
+default:
+  compute_device: gpu0
+  data_source: auto
+
+rules:
+  # ---- attention 链 GEMM + LLM 框架算子 → GPU ----
+  - op: "L*_qkv_proj"          # QKV 投影（INT8 GEMM）
+    device: gpu0
+  - op: "L*_attn_score"        # Q·K^T（INT8 GEMM）
+    device: gpu0
+  - op: "L*_attn_context"      # P·V（INT8 GEMM）
+    device: gpu0
+  - op: "L*_o_proj"            # 输出投影（INT8 GEMM）
+    device: gpu0
+  - op: "L*_kv_cache_write"    # KV 写缓存（INT4 数据、无执行 → GPU 大容量）
+    device: gpu0
+  - op: "L*_kv_cache_read"     # KV 读缓存（INT4 数据、无执行）
+    device: gpu0
+  # ---- FFN 三个 GEMM → DRAM-PIM（权重就地，PIM 收益）----
+  - op: "L*_ffn_gate"
+    device: pim0
+  - op: "L*_ffn_up"
+    device: pim0
+  - op: "L*_ffn_down"
+    device: pim0
+  # ---- 逐元素/激活 → SRAM-PIM（高带宽，FP16 执行）----
+  - op: "L*_ffn_silu"
+    device: sram0
+  - op: "L*_resid1"
+    device: sram0
+  - op: "L*_resid2"
+    device: sram0
+  # ---- FP32 非线性只能放 GPU（唯一支持 FP32 执行的硬件）----
+  - op: "L*_ln1"
+    device: gpu0
+  - op: "L*_ln2"
+    device: gpu0
+  - op: "L*_rope"
+    device: gpu0
+  - op: "L*_softmax"
+    device: gpu0
+  # ---- 全局：Embedding → GPU，LMHead → ReRAM-PIM（FP8 词表）----
+  - op: "embedding"
+    device: gpu0
+  - op: "lm_head"
+    device: rram0
+
+  # 兜底：其它未显式列出的算子默认 GPU
+  - op_type: GEMM
+    device: gpu0
+  - op_type: LayerNorm
+    device: gpu0
+  - op_type: Softmax
+    device: gpu0
+  - op_type: Residual
+    device: gpu0
+  - op_type: Activation
+    device: gpu0
+  - op_type: Embedding
+    device: gpu0
+  - op_type: LMHead
+    device: gpu0
+  - op_type: KVCacheUpdate
+    device: gpu0

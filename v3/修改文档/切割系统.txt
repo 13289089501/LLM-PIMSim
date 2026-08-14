@@ -1,0 +1,59 @@
+切割系统功能核查和修改意见
+切割系统应该具有如下功能：
+1、算子应该被允许沿形状维度切割，切割后该算子部分参数（计算量，存储）应该跟随变化。例如：算子形状为64*64*32层，沿层切割为32层共两份，则计算量和存储都要减半。切割后的算子需要连接的端口不应该改变。
+2、权重应该被允许沿形状维度切割，切割后权重的存储量应该跟随变化。值得注意的是：权重被切割后其要相连的算子应该连接所有权重分片，例如算子A需要权重B，B被切割为B1和B2，则A必须连接B1和B2。
+
+修改建议：
+1、目前切割系统对于‘形状’参数的定义还不够明确，算子和权重的形状还需要确定。
+
+=== agent回答 ===
+【现状核查】
+你列的两条功能，当前系统（core/splitter.py）已实现，且符合你的描述：
+
+1) 算子沿形状维度切割，计算/存储随维度比例变化、端口不变：
+   - split_kernel_dict(kernel, dim, parts)：dim 必须是 attributes 里的键（M/K/N/seq/kv_len 等）。按"该维比例"缩放 compute_flops 和 memory_bytes，op_type/inputs/outputs/intermediates 保持不变（端口不变）。
+   - 例：N=11008 切 [5504,5504] → 两段各 N=5504，计算量/存储各约减半。
+
+2) 权重切割 + ALL-GATHER（消费该权重的算子必须连接全部切片）：
+   - make_weight_partitions(wb, n)：按 wb.split_dim（rows/cols）等分，生成 WeightPartition 列表，各自 bytes 跟随形状。
+   - ALL-GATHER：校验系统 W1 规则检查算子是否连满全部切片；调度器 _check_ready_ops 对所有切片就绪才放行。两者双实现，符合"必须连接全部切片"的语义。
+
+【关于"形状"定义的回答】
+你说得对，这是核心待确认点。建议把"形状"定义成统一、结构化的描述，供切割/校验/输出共用。我的建议：
+
+定义"形状"为一个元组或结构化对象，语义为"多维张量尺寸 + 是哪类实体"：
+- 算子形状：把它定义为**输入张量 + 输出张量的尺寸集合**，而不是单一数组。因为算子（GEMM）计算量由 M×N×K 决定，切割维就是 K/M/N；但层数（如 32 层）是"重复体量"，不该和单层张量混在一个 dim。
+- 权重形状：就是二维矩阵 rows×cols（+ 层数 layer），较简单。
+
+建议引入一个 shape 规范，例如：
+- 用 `dims`（各维尺寸）+ `dims_split_dim`（允许沿哪个维度切，如 gemm 允许 M/K/N、seq）表达；
+- 把"层数"单独放一个字段，别塞进 shape，这样切割"层"和切割"特征维"是两种语义，避免混淆。
+
+具体尺寸字段映射建议（llama7b）：
+- hidden=4096，ffn=11008，heads=32，head_dim=128，vocab=32000，seq 可变（prefill=2048/decode 逐 token）。
+- QKV_proj：M=1×seq, K=4096, N=3×4096
+- Attn_Score：M=1×seq ×heads, K=head_dim, N=kv_len
+- FFN_gate/up：M, K=4096, N=11008；FFN_down：M, K=11008, N=4096
+- LMHead：M, K=4096, N=vocab=32000
+- RoPE/Softmax/LN/Residual/Activation：逐元素，形状=hidden 或 seq 相关，一般不切或沿 seq 切。
+
+建议下一期先把"shape 结构化（算子显式给 dims + 可切维 + 层数）"做出来，切割系统直接读它，而不是靠 attributes 里的松散 key。这样切割、校验、显示都用同一份形状真相。
+
+=== 修改方案（已确认，直接执行） ===
+目标：在切割系统 core/splitter.py 内新增"统一形状"数据结构与辅助，让算子切割不再依赖 attributes 里的松散 key，同时保留向后兼容。
+
+改动点：
+1) 新增 Shape 数据结构（core/splitter.py）：
+   - dims: dict[str, int]  各维尺寸（如 {"M":N, "K":h, "N":f}）
+   - split_dims: list[str] 允许沿哪些维度切割（如 ["K","N"]，"seq","kv_len"）
+   - layer: Optional[int]  该算子的层号（从 id "L{n}_" 提取；None=全局如 embed/lm_head）
+2) 新增辅助 kernel_shape(kernel_or_attrs) -> Shape：
+   - 从算子 id 提取 layer（匹配 L{n}_ 前缀）；
+   - 把 attributes 里数值型维度收进 dims（跳过 "kv_len" 这类字符串占位，单独标记可切）；
+   - 给出该算子的 split_dims 建议（数值型 M/K/N 与字符串 seq/kv_len 都算可切）；
+   - 类型兼容：接受 dict 或带 attributes 的对象。
+3) 让 split_kernel_dict 内部改用 kernel_shape 校验"dim 可切"（找不到时给出可切维列表，报错信息更友好），并支持取值 dims/attributes。
+4) Shape 提供 to_dict() 供输出/前展示用；提供 split_dim_ratio() 计算"按某维部分之比缩放"的统一函数（切割共用）。
+
+说明：shape 规范先在切割系统落地；算子系统后续（如与 layer 模板化一起）可选用它保存算子形状。
+不牵动算子系统建模、不牵动前端。现有 split_kernel_dict 调用方式保持兼容。

@@ -1,0 +1,29 @@
+# placement.yaml — 数据初始驻留（用户决定：数据一开始放哪，可冗余多设备）
+# 用户先定初始位置，算子从哪读由 mapping.yaml 的 each op.inputs.from 决定
+#
+# v3 整合说明：本文件基于 workload/kernel 新路径（唯一标准）。权重 id 采用统一命名
+#   embed_weight / L0_qkv_weight / L0_o_proj_weight / L0_gate_weight /
+#   L0_up_weight / L0_down_weight / lm_head_weight 等。旧的 L0_q_weight/L0_ffn1_weight
+#   命名已废弃，不再匹配任何 tensor。
+
+default_device: gpu0
+
+initial:
+  # 权重：默认驻留 PIM（权重驻留 → PIM 收益来源）
+  - data_type: WEIGHT
+    devices: [pim0]
+
+  # 特定权重可以冗余驻留多个设备（谁用就近读）
+  # 例: FFN_down 权重冗余驻留 PIM+GPU，两种设备谁就近谁读
+  - data_id: "L0_down_weight"
+    devices: [pim0, gpu0]
+
+  # KV Cache：驻留 GPU
+  - data_type: KV_CACHE
+    devices: [gpu0]
+
+  # 激活/中间数据：默认 GPU
+  - data_type: ACTIVATION
+    devices: [gpu0]
+  - data_type: TEMPORARY
+    devices: [gpu0]

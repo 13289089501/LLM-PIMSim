@@ -1,0 +1,35 @@
+# 04_ic_reference_placement.yaml — IC 参考：数据/权重初始驻留
+# 集成电路视角：
+#   - attention 相关权重(W_attn: qkv/o_proj)放在 GPU（算子也在 GPU → 0 搬运）
+#   - FFN 权重(W_mlp: gate/up/down)放在 DRAM-PIM（FFN 算子也在 PIM → 权重就地）
+#   - 词表权重(lm_head_weight / embed_weight)按精度放 ReRAM / GPU
+#   - KV Cache / 中间激活 / 临时数据放 GPU（大容量、随 token 增长的 KV 放这）
+# 用 data_id 通配匹配 workload 命名；未匹配到的按 data_type 兜底。
+default_device: gpu0
+
+initial:
+  # ---- 权重：就近算子所在设备 ----
+  - data_id: "*qkv_weight"        # W_attn：QKV → GPU
+    devices: [gpu0]
+  - data_id: "*o_proj_weight"     # W_attn：O → GPU
+    devices: [gpu0]
+  - data_id: "*gate_weight"       # W_mlp：gate → DRAM-PIM
+    devices: [pim0]
+  - data_id: "*up_weight"         # W_mlp：up → DRAM-PIM
+    devices: [pim0]
+  - data_id: "*down_weight"       # W_mlp：down → DRAM-PIM
+    devices: [pim0]
+  - data_id: "embed_weight"       # 词表嵌入 → GPU
+    devices: [gpu0]
+  - data_id: "lm_head_weight"     # 词表输出 → ReRAM-PIM（FP8）
+    devices: [rram0]
+
+  # ---- 其它权重 / KV / 激活 / 中间数据兜底到 GPU ----
+  - data_type: WEIGHT
+    devices: [gpu0]
+  - data_type: KV_CACHE
+    devices: [gpu0]
+  - data_type: ACTIVATION
+    devices: [gpu0]
+  - data_type: TEMPORARY
+    devices: [gpu0]

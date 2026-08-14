@@ -1,0 +1,13 @@
+# interconnect.yaml — 设备连接（非对称读写带宽）
+# 不写带宽 → 自动查"默认连接表"(GPU↔GPU 类NVLink / GPU↔DRAM_PIM 类PCIe 等)
+links:
+  - src: gpu0
+    dst: pim0
+    read_bandwidth_gbs: 120      # gpu0 从 pim0 读 → 带宽120GB/s
+    write_bandwidth_gbs: 80      # gpu0 写 pim0 → 带宽80GB/s（读写分开）
+    latency_ns: 500
+    bidirectional: true          # 自动生成反向连接
+
+  # 示例：两个默认硬件相连，不写带宽也能跑（用默认连接表）
+  # - src: gpu0
+  #   dst: gpu1                  # GPU↔GPU 不写带宽 → 600/600 GB/s, 100ns

@@ -1,0 +1,37 @@
+算子系统功能核查和修改意见
+算子系统应该具有以下功能：
+1、应该正确显示算子参数，包括：端口信息（即所需要的数据），计算量，存储量，中间数值存储量（如有），两种精度，形状（不知道这么表述是否正确）。
+2、算子可以与设备端口相连，代表从改设备读/取数据。
+3、算子应该可以被放置在设备内，代表该算子在设备内进行运算。
+4、目前的算子划分已经固定，都是基于llama7b进行的。
+
+修改意见：
+1、对于参数会动态变化的算子，例如随KV增长的算子，我们引入了函数，在显示的时候，应该显示的是参数范围，而非定值。
+2、llama7b模型是一个32层的模型，我们不对每一层的重复算子进行重复建模，对于重复的算子，我们在形状参数里显示其层数，用于切割。
+3、KV增长的建模是否有待完善呢？还是只引入代价函数即可？
+
+=== agent回答 ===
+【现状核查】
+你列的 4 条功能，当前系统（core/operator_sys.py）基本实现：
+
+1) 正确显示算子参数：Operator 有 id/name/op_type/flops/category/data_precision/execution_precision/input_ids/output_ids/shape_desc。但"端口（数据）"目前用 input_ids/output_ids 字符串列表表达，还没有独立的"端口对象"（含方向/数据类型/形状）。"形状"目前是 shape_desc 字符串（如 str(attributes)），不是结构化字段。→ 这是可改进点。
+
+2) 算子连接设备端口读数据：由 mapping/placement/scheduler 完成，算子系统只管"要哪些输入/产出哪些输出"。
+
+3) 算子放入设备运算：由 compute_map + scheduler 实现。
+
+4) 划分固定（llama7b）：WorkloadBuilder 里每层 16 个算子 + 2 全局 = 18 类，hardcode 在 core/operator_sys.py。层数/维度由 model_lib.MODEL_DIMS 或 experiment.yaml 的 workload 段决定。
+
+【针对三个修改意见的回答】
+
+1) 动态参数显示为范围：
+   - 现状：workload 层已经支持（Cost 用 [min,max] 区间，KV 相关算子有 cost_fn(kv_len)），但执行层 WorkloadAdapter 目前只用 compute_flops_min（Prefill 单一代表值）展开成可执行 Operator。→ 即"建模层有范围、执行层取定值"。
+   - 建议：把"范围"下沉到显示/结果。可以给 Operator 增加 compute_flops_min/max、memory_bytes_min/max 字段（或一个 cost_range 对象），让输出系统能按范围展示；调度仍可用代表值或最坏值。推荐先做到"显示范围"，不马上改调度为区间调度。
+
+2) 32 层重复算子不逐层建模、用形状里的层数表达：
+   - 现状：恰恰相反，WorkloadBuilder 是逐层展开的（L0..L31 每层一套完整算子），GUI 依赖图也按层展示。这也是 514=32×16+2 的由来。
+   - 建议：你说得对，逐层展开冗余且数据大。可以改为"一层模板 + 层数元信息（num_layers）"，算子 id 用 `L*_ln1` 这类通配，调度/结果显示时再实例化。但这是较大的结构改动，会影响 scheduler/验证/输出。建议先评估：如果只是想减少 GUI 画布负担，前端层独立处理更快；后端是否真要"模板化"可以单独一期做。当前"逐层展开"功能是对的，只是体量问题。
+
+3) KV 模型是否完善：
+   - 现状：KVCache 结构 + KV 相关算子 cost_fn(kv_len) 已有，但执行层取 Prefill 代表值，Decode 逐 token 的 KV 膨胀没真正进总延迟。
+   - 建议：这确实需要完善。推荐路径是"从 Decode 步数展开"：用 decode_steps 逐 token 建模，KV 长度从 kv_start 递增到 kv_end，KV_Cache_Write/Read、Attn_Score/Softmax/Context 的成本随长度算，调度器按 token 推进，得到真实的逐 token 延迟增长。这是目前仿真真实度最大的缺口，建议作为下一期重点。

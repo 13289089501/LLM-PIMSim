@@ -1,0 +1,29 @@
+# mapping.yaml — 算子→设备 + 算子所需数据从哪来（用户从算子出发决定）
+# 规则从上往下匹配：先按 op_id 精确/通配，再按 op_type。
+# 每个算子块统一回答两件事: ① 放哪算(device) ② 每份输入从哪取(from)
+
+default:
+  compute_device: gpu0       # 兜底：没写 device 的算子默认放这
+  data_source: auto          # 兜底：没写 from 的输入，用调度器"就近参考"
+
+rules:
+  # --- 示例1：FFN 放 PIM，权重从 PIM 取（权重驻留目标）---
+  - op: "L0_ffn1"            # 或写 op_type: GEMM 匹配一类（见下方通用规则）
+    device: pim0
+    inputs:
+      - data: "L0_ln2_out"
+        from: pim0           # 用户固定：这份输入从 pim0 取
+      - data: "L0_ffn1_weight"
+        from: pim0           # 权重驻留在 PIM，从 PIM 读 → 0 搬运
+    split: {dim: K, num_parts: 4}    # ← 分片预留（第一版不实现算法，仅记录）
+
+  # --- 示例2：只有 "放哪算"，输入数据源交给调度器就近参考 ---
+  - op: "L0_attn"
+    device: gpu0
+    # inputs 不写 → 各输入用就近参考(auto)
+
+  # --- 通用规则：所有 GEMM + LayerNorm 兜底到 GPU ---
+  - op_type: GEMM
+    device: gpu0
+  - op_type: LayerNorm
+    device: gpu0
