@@ -27,32 +27,57 @@ DEFAULT_CONNECT_TABLE = {
 }
 
 # 设备出厂预设（默认参数，YAML 里写了 value 就覆盖它）
+# 单位约定: peak_tflops 存 TFLOPS(解析乘 1e12→FLOPS)、带宽存 GB/s(解析乘 1e9→Bps)、
+#           容量 mem_gb/mem_mb 存 GB/MB(解析乘 1e9/1e6→Byte)、延迟统一 ns。
+# ============ 数据来源（硬件校准参考） ============
+#   CPU       : Intel Xeon Platinum 8480+ (Sapphire Rapids)，DDR5-4800，BF16 AMX 峰值
+#   GPU       : NVIDIA A100 80GB SXM，BF16/FP16 Tensor Core dense 峰值(不含 sparsity)
+#   SRAM-PIM  : 7nm SRAM-CIM，ISSCC 类代表值
+#   DRAM-PIM  : Samsung HBM2-PIM Aquabolt-XL（单 stack 代表值）
+#   ReRAM-PIM : NeuRRAM/RRAM-CIM，Nature 2023 类代表值（读写不对称）
 DEFAULT_DEVICE_PARAMS = {
+    # CPU: Intel Xeon Platinum 8480+ Sapphire Rapids, DDR5-4800
+    "CPU": {
+        "peak_tflops_default": 45.9,   # BF16 AMX 峰值
+        "mem_gb_default": 512,
+        "read_bw_gbs_default": 307.2, "write_bw_gbs_default": 307.2,
+        "read_lat_ns_default": 90, "write_lat_ns_default": 90,
+        "parallelism_default": 1,
+        "efficiency_default": {},
+    },
+    # GPU: NVIDIA A100 80GB SXM (312 TFLOPS = dense BF16/FP16 Tensor Core，不含 sparsity)
     "GPU": {
-        "peak_tflops_default": 300.0, "mem_gb_default": 80,
-        "read_bw_gbs_default": 2000.0, "write_bw_gbs_default": 1800.0,
-        "read_lat_ns_default": 100, "write_lat_ns_default": 100,
+        "peak_tflops_default": 312.0,
+        "mem_gb_default": 80,
+        "read_bw_gbs_default": 2039.0, "write_bw_gbs_default": 2039.0,
+        "read_lat_ns_default": 400, "write_lat_ns_default": 400,
         "parallelism_default": 100,
         "efficiency_default": {"GEMM": 0.85, "Attention": 0.60, "Softmax": 0.30, "LayerNorm": 0.25},
     },
-    "DRAM_PIM": {
-        "peak_tops_default": 50.0, "mem_gb_default": 512,
-        "read_bw_gbs_default": 800.0, "write_bw_gbs_default": 600.0,
-        "read_lat_ns_default": 50, "write_lat_ns_default": 80,
-        "parallelism_default": 16,
-        "efficiency_default": {"GEMM": 0.70, "Attention": 0.40, "Softmax": 0.20, "LayerNorm": 0.15},
-    },
+    # SRAM-PIM: 7nm SRAM-CIM (ISSCC 类，代表值) — 1.5 PB/s = 1,500,000 GB/s，勿写成 1500 GB/s
     "SRAM_PIM": {
-        "peak_tops_default": 200.0, "mem_mb_default": 128,
-        "read_bw_gbs_default": 4000.0, "write_bw_gbs_default": 3000.0,
-        "read_lat_ns_default": 5, "write_lat_ns_default": 5,
+        "peak_tflops_default": 500.0,   # FP16/BF16
+        "mem_mb_default": 512,
+        "read_bw_gbs_default": 1500000.0, "write_bw_gbs_default": 1500000.0,
+        "read_lat_ns_default": 2, "write_lat_ns_default": 2,
         "parallelism_default": 32,
         "efficiency_default": {"GEMM": 0.80, "Attention": 0.50, "Softmax": 0.30, "LayerNorm": 0.25},
     },
+    # DRAM-PIM: Samsung HBM2-PIM Aquabolt-XL（单 stack 代表值；多 stack 时按 stack 数扩展容量）
+    "DRAM_PIM": {
+        "peak_tflops_default": 1.2,     # FP16
+        "mem_gb_default": 8,
+        "read_bw_gbs_default": 307.2, "write_bw_gbs_default": 307.2,
+        "read_lat_ns_default": 50, "write_lat_ns_default": 50,
+        "parallelism_default": 16,
+        "efficiency_default": {"GEMM": 0.70, "Attention": 0.40, "Softmax": 0.20, "LayerNorm": 0.15},
+    },
+    # ReRAM-PIM: NeuRRAM/RRAM-CIM (Nature 2023 类，代表值) — 读写严格不对称
     "RERAM_PIM": {
-        "peak_tops_default": 100.0, "mem_gb_default": 1000,
-        "read_bw_gbs_default": 300.0, "write_bw_gbs_default": 100.0,
-        "read_lat_ns_default": 200, "write_lat_ns_default": 2000,
+        "peak_tflops_default": 20.0,    # INT8
+        "mem_mb_default": 64,
+        "read_bw_gbs_default": 128.0, "write_bw_gbs_default": 32.0,
+        "read_lat_ns_default": 10, "write_lat_ns_default": 100,
         "parallelism_default": 64,
         "efficiency_default": {"GEMM": 0.60, "Attention": 0.30, "Softmax": 0.10, "LayerNorm": 0.10},
     },
@@ -67,7 +92,7 @@ class HardwareConfig:
     """单个硬件的解析后配置"""
     id: str
     type: str                          # GPU / DRAM_PIM / SRAM_PIM / RERAM_PIM
-    peak_f: float                      # 标准单位 FLOPS
+    peak_f: float                      # 标准单位 FLOPS（兼容字段：默认精度 FP16 的峰值算力，供 performance 沿用）
     mem_bytes: int                     # 标准单位 Byte
     read_bw: float                     # Bps
     write_bw: float                    # Bps
@@ -76,6 +101,7 @@ class HardwareConfig:
     parallelism: int
     efficiency: dict
     precision: list = field(default_factory=list)   # 支持的精度，空=默认支持全部
+    peak_by_precision: dict = field(default_factory=dict)  # {PrecisionLevel: FLOPS} 按精度峰值算力（无则用 peak_f 统一值）
 
 
 @dataclass
@@ -161,7 +187,7 @@ def load_experiment(exp_path: str) -> "ExperimentIngredient":
 
     cfg = ExperimentConfig(
         name=exp.get("experiment", {}).get("name", "unnamed"),
-        model=exp.get("experiment", {}).get("model", "tiny"),
+        model=exp.get("experiment", {}).get("model", "llama7b"),
         seed=exp.get("experiment", {}).get("seed", 42),
     )
     # 输出目录
@@ -199,6 +225,71 @@ def _resolve(base_dir: str, rel: str) -> str:
     return os.path.join(base_dir, rel)
 
 
+def _throughput_to_flops(value, unit: str) -> float:
+    """把"数值+单位"(TFLOPS/TOPS/GMAC/s/TMAC/s/FLOPS) 统一换算成 FLOPS。
+    沿用现有约定: TFLOPS 与 TOPS 都按 1e12 换算；GMAC/s、TMAC/s 按 1 MAC=2 FLOP。"""
+    v = float(value)
+    u = (unit or "").strip().upper()
+    if not u:
+        return v  # 无单位视为裸 FLOPS
+    mults = {
+        "TFLOPS": 1e12, "TFLOP/S": 1e12,
+        "TOPS": 1e12, "TOP/S": 1e12,
+        "GFLOPS": 1e9, "GFLOP/S": 1e9,
+        "GMAC/S": 2e9, "TMAC/S": 2e12,
+        "FLOPS": 1.0, "FLOP/S": 1.0,
+    }
+    return v * mults.get(u, 1e12)  # 未知单位默认按 1e12 量级
+
+
+def _default_precision_list():
+    """默认支持的精度（与 hardware_factory 的默认一致）。"""
+    from contracts import PrecisionLevel as _PL
+    return [_PL.FP32, _PL.BF16, _PL.FP16, _PL.FP8, _PL.INT8, _PL.INT4]
+
+
+def _parse_peak_throughput(comp: dict, pre: dict):
+    """解析 compute 下的峰值算力，返回 (兼容 peak_f, peak_by_precision)。
+    - 新格式: compute.peak_throughput: {FP16:{value,unit}, ...}
+    - 旧格式: compute.peak_tflops / compute.peak_tops（单值, 填到默认全部精度）
+    - 都不写: 取该类型的出厂默认单值。"""
+    from contracts import PrecisionLevel as _PL
+    throughput = comp.get("peak_throughput", {})
+    if throughput and isinstance(throughput, dict):
+        peak_by_precision = {}
+        for pname, entry in throughput.items():
+            try:
+                prec = _PL.from_name(str(pname))
+            except ValueError:
+                raise ConfigError(f"peak_throughput 含未知精度: '{pname}'。可选: FP32/FP16/BF16/INT8/INT4")
+            if isinstance(entry, dict):
+                peak_by_precision[prec] = _throughput_to_flops(
+                    entry.get("value", 0), entry.get("unit", ""))
+            else:
+                # 直接写数值/字符串 => 视为 TFLOPS 量级
+                peak_by_precision[prec] = _throughput_to_flops(entry, "TFLOPS")
+        if not peak_by_precision:
+            peak_by_precision = {}
+        # 兼容字段 peak_f = FP16(或首个) 的算力
+        default_fp16 = _PL.FP16
+        peak_f = peak_by_precision.get(default_fp16) or next(iter(peak_by_precision.values()), 0.0)
+        return peak_f, peak_by_precision
+
+    # 旧格式/出厂默认：单值填到默认全部精度
+    pre_peak = pre.get("peak_tflops_default", 300.0)
+    if "peak_tflops" in comp:
+        peak_f = float(comp["peak_tflops"]) * 1e12
+    elif "peak_tops" in comp:
+        peak_f = float(comp["peak_tops"]) * 1e12
+    else:
+        if "peak_tops_default" in pre:
+            peak_f = float(pre.get("peak_tops_default")) * 1e12
+        else:
+            peak_f = float(pre_peak) * 1e12
+    peak_by_precision = {p: peak_f for p in _default_precision_list()}
+    return peak_f, peak_by_precision
+
+
 def _parse_hardware(doc: dict) -> dict:
     """hardware.yaml -> {id: HardwareConfig}"""
     out = {}
@@ -218,12 +309,8 @@ def _parse_hardware(doc: dict) -> dict:
         mem = d.get("memory", {})
         eff = d.get("efficiency", pre.get("efficiency_default", {}))
 
-        # 峰值计算
-        peak_f = pre.get("peak_tflops_default", 300.0) * 1e12  # FLOPS 基准
-        if "peak_tflops" in comp:
-            peak_f = float(comp["peak_tflops"]) * 1e12
-        elif "peak_tops" in comp:
-            peak_f = float(comp["peak_tops"]) * 1e12
+        # 峰值计算（多精度支持：新格式 peak_throughput 或旧格式单值）
+        peak_f, peak_by_precision = _parse_peak_throughput(comp, pre)
 
         # 容量
         mem_bytes = pre.get("mem_gb_default", 80) * 1e9
@@ -248,21 +335,28 @@ def _parse_hardware(doc: dict) -> dict:
         write_lat = int(mem.get("write_latency_ns", pre.get("write_lat_ns_default", 100)))
         parallel = int(comp.get("parallelism", pre.get("parallelism_default", 1)))
 
-        # 精度支持：hardware.yaml 里写 supported_precision 则覆盖（支持 4 档之一或多个），
-        # 不写或为空则默认支持全部四种。
-        precision_raw = d.get("supported_precision", [])
+        # 精度支持：
+        # - 若配置了 peak_throughput，则 supported_precision 由它的 key 派生（单一事实来源，避免不一致）；
+        # - 否则保留显式 supported_precision 字段（不写则默认全部四种，向后兼容）。
+        from contracts import PrecisionLevel as _PL
         precision = []
-        if precision_raw:
-            from contracts import PrecisionLevel as _PL
-            for pname in precision_raw:
-                try:
-                    precision.append(_PL.from_name(str(pname)))
-                except ValueError as e:
-                    raise ConfigError(f"设备 {dev_id} 的 supported_precision 含未知精度: '{pname}'. "
-                                      f"可选 FP32/FP16/INT8/INT4")
+        if peak_by_precision:
+            precision = list(peak_by_precision.keys())
+        else:
+            precision_raw = d.get("supported_precision", [])
+            if precision_raw:
+                for pname in precision_raw:
+                    try:
+                        precision.append(_PL.from_name(str(pname)))
+                    except ValueError as e:
+                        raise ConfigError(f"设备 {dev_id} 的 supported_precision 含未知精度: '{pname}'. "
+                                          f"可选 FP32/FP16/INT8/INT4")
+            else:
+                precision = _default_precision_list()
 
         out[dev_id] = HardwareConfig(
-            id=dev_id, type=dtype, peak_f=peak_f, mem_bytes=int(mem_bytes),
+            id=dev_id, type=dtype, peak_f=peak_f,
+            peak_by_precision=peak_by_precision, mem_bytes=int(mem_bytes),
             read_bw=read_bw, write_bw=write_bw, read_lat_ns=read_lat,
             write_lat_ns=write_lat, parallelism=parallel, efficiency=dict(eff),
             precision=precision,

@@ -1,0 +1,273 @@
+任务目标
+仅在现有 LLM-PIMSim 项目中调整算子划分，并为每个算子设置 category、data_precision、execution_precision 三个字段。只保留 LLaMA-7B 模型构建路径，删除其他模型支持。不得修改性能模型、调度器、离散事件仿真、效率表、Precision 枚举、Hardware Capability 定义或任何延时计算逻辑。
+
+算子调整
+删除原有 Attn_QK 和 Attn_AV，新增以下五个算子：
+
+QKV_proj
+
+RoPE
+
+Attn_Score
+
+Attn_Context
+
+KV_Cache_Read
+
+将 KVUpdate 改名为 KV_Cache_Write，并将其位置移到 RoPE 之后。
+
+每层 decoder block 的算子顺序必须为：
+
+text
+LN1
+QKV_proj
+RoPE
+KV_Cache_Write
+KV_Cache_Read
+Attn_Score
+Softmax
+Attn_Context
+O_proj
+Residual1
+LN2
+FFN_gate
+FFN_up
+SiLU
+FFN_down
+Residual2
+模型首尾保留 Embedding 和 LMHead。
+
+算子属性固定表
+以下 18 个算子的 category、data_precision、execution_precision 已经确定，Agent 必须严格按此设置，不允许修改。该配置已根据现有硬件能力平衡，满足每个硬件支持算子数量不超过 12 个。
+
+算子	Category	data_precision	execution_precision
+Embedding	LINEAR	FP16	None
+LN1	NONLINEAR	FP32	FP32
+QKV_proj	LINEAR	INT8	INT8
+RoPE	NONLINEAR	FP32	FP32
+KV_Cache_Write	LINEAR	INT4	None
+KV_Cache_Read	LINEAR	INT4	None
+Attn_Score	LINEAR	INT8	INT8
+Softmax	NONLINEAR	FP32	FP32
+Attn_Context	LINEAR	INT8	INT8
+O_proj	LINEAR	INT8	INT8
+Residual1	NONLINEAR	FP16	FP16
+LN2	NONLINEAR	FP32	FP32
+FFN_gate	LINEAR	INT8	INT8
+FFN_up	LINEAR	INT8	INT8
+SiLU	NONLINEAR	FP16	FP16
+FFN_down	LINEAR	INT8	INT8
+Residual2	NONLINEAR	FP16	FP16
+LMHead	LINEAR	FP8	FP8
+说明：FP32 用于那些 CPU 专用的非线性算子（如 LN1、RoPE、Softmax、LN2），FP8 用于仅 ReRAM-PIM 能执行的 LMHead，这样可避免 CPU 和 SRAM-PIM 支持所有算子。INT4 用于 KV cache 写读，使 GPU 因不支持 INT4 而不支持这些算子，从而控制 GPU 支持数量。该表在不动硬件能力的前提下尽量平衡了各硬件支持数。
+
+实施要求
+集中管理上述算子属性表，避免在模型构建函数中散落硬编码。例如可以在 model_lib.py 或新的 operator_registry.py 中定义字典或映射。
+
+修改模型构建逻辑，仅保留 LLaMA-7B 路径，按上述顺序生成算子 DAG。
+
+确保每个算子实例化时正确设置 category、data_precision、execution_precision 字段。
+
+不要修改任何 performance.py、scheduler.py、效率表、Precision 枚举或 Hardware Capability 定义。
+
+如果现有代码有自动精度推导或模型级精度配置，请禁用或绕过，直接使用本表中给定的值。
+
+验证要求
+运行模型构建和兼容性检查，输出以下内容：
+
+生成的算子列表及顺序。
+
+每个硬件实际支持的算子列表和数量（必须 ≤ 12）。
+
+完整的 18×5 兼容性矩阵（格式：Operator, CPU, GPU, SRAM-PIM, DRAM-PIM, ReRAM-PIM）。
+
+确认调度器能够为每个算子找到至少一个合法设备执行。
+
+完成输出
+修改的文件列表。
+
+新的算子 DAG 结构描述。
+
+兼容性矩阵结果。
+
+每个硬件支持的算子数量统计。
+
+简要说明如何集中管理算子属性表。
+
+
+
+任务目标
+仅修改现有 LLM-PIMSim 项目中的算子定义和模型构建逻辑，使其适配 LLaMA-7B 真实推理结构。精度系统、硬件能力、兼容性检查逻辑、性能模型、调度器、效率表、延时计算公式均保持不变。只需调整算子划分、按给定表格设置算子属性（category/data_precision/execution_precision），并正确建立算子间数据依赖和模型展开方式。
+
+1. 算子列表与属性（固定不变）
+删除旧算子 Attn_QK、Attn_AV，将 KVUpdate 改名为 KV_Cache_Write，并新增 QKV_proj、RoPE、Attn_Score、Attn_Context、KV_Cache_Read。
+
+每层 decoder block 算子顺序如下（首尾为全局算子 Embedding 和 LMHead）：
+
+序号	name	op_type	Category	data_precision	execution_precision
+1	Embedding	EMBEDDING	LINEAR	FP16	None
+2	LN1	LAYERNORM	NONLINEAR	FP32	FP32
+3	QKV_proj	GEMM	LINEAR	INT8	INT8
+4	RoPE	ROPE	NONLINEAR	FP32	FP32
+5	KV_Cache_Write	KVCACHE_WRITE	LINEAR	INT4	None
+6	KV_Cache_Read	KVCACHE_READ	LINEAR	INT4	None
+7	Attn_Score	GEMM	LINEAR	INT8	INT8
+8	Softmax	SOFTMAX	NONLINEAR	FP32	FP32
+9	Attn_Context	GEMM	LINEAR	INT8	INT8
+10	O_proj	GEMM	LINEAR	INT8	INT8
+11	Residual1	RESIDUAL	NONLINEAR	FP16	FP16
+12	LN2	LAYERNORM	NONLINEAR	FP32	FP32
+13	FFN_gate	GEMM	LINEAR	INT8	INT8
+14	FFN_up	GEMM	LINEAR	INT8	INT8
+15	SiLU	ACTIVATION	NONLINEAR	BF16	BF16
+16	FFN_down	GEMM	LINEAR	INT8	INT8
+17	Residual2	RESIDUAL	NONLINEAR	FP16	FP16
+18	LMHead	GEMM	LINEAR	FP8	FP8
+所有算子实例化时必须按此表设置 category、data_precision、execution_precision，不得自行修改。集中管理这些规则（例如 operator_registry.py 或集中字典），避免散落硬编码。
+
+2. 模型构建：模板复制展开机制（重要）
+不要为每一层单独手写算子，必须遵循现有项目的模板复制模式：
+
+在 WorkloadBuilder.build() 中，先调用 _make_layer_kernels(0, seq, batch) 生成第 0 层模板（包含上表中除 Embedding 和 LMHead 外的 16 个算子，注意 Embedding 和 LMHead 是全局算子，不在层模板内）。
+
+对每一层 L（0 到 num_layers-1，本项目 num_layers=32），遍历这份模板，将每个算子的 id 和所有 inputs/intermediates/outputs 中的 L0_ 前缀替换为 L{L}_。
+
+从模板复制 name、op_type、attributes，然后对复制出的每个算子调用 _bind_cost(L, seq, batch) 重新绑定成本（cost_fn(kv_len) 按层号无关，所以各层成本相同）。
+
+32 层完全同构，只是 id 与数据对象按层号区分，确保权重分片、映射、调度能按层独立寻址。
+
+全局算子 Embedding 和 LMHead 只追加一份，不参与层模板复制。
+
+在层间连接时，需要建立跨层数据依赖：第 L 层的 Residual2 输出数据对象（L{L}_layer_output）应作为第 L+1 层的输入数据对象（L{L+1}_hidden_states）。具体做法：在构建循环中，将上一层的 layer_output 与下一层的 hidden_states 建立同一数据对象引用，或显式添加边。
+
+确保 config.num_layers 正确记录层数。
+
+3. 数据对象定义与依赖关系（每层模板）
+在模板中，需要定义以下数据对象并连接算子。所有中间张量标记为 intermediates=True（不落盘但参与局部读写数据量计算）；权重对象和 KV cache 为非中间数据。
+
+数据对象列表
+输入：L{L}_hidden_states（第 0 层为全局 hidden_states，来自 Embedding）
+
+权重：token_embedding_weight（全局，仅 Embedding）、L{L}_qkv_weight、L{L}_o_proj_weight、L{L}_gate_weight、L{L}_up_weight、L{L}_down_weight（层内权重，各自带层前缀）、lm_head_weight（全局，仅 LMHead）
+
+中间张量：L{L}_ln1_out、L{L}_q、L{L}_k、L{L}_v、L{L}_q_rot、L{L}_k_rot、L{L}_attn_scores、L{L}_attn_probs、L{L}_attn_context、L{L}_attn_output、L{L}_h1、L{L}_ln2_out、L{L}_gate_out、L{L}_up_out、L{L}_silu_out、L{L}_mlp_output、L{L}_layer_output
+
+KV cache：L{L}_kv_cache，每层独立，大小随 kv_len 增长，跨步持久。
+
+模板内依赖（第 L 层）
+text
+Embedding(input_ids, token_embedding_weight) -> hidden_states  # 全局
+LN1(L{L}_hidden_states) -> L{L}_ln1_out
+QKV_proj(L{L}_ln1_out, L{L}_qkv_weight) -> L{L}_q, L{L}_k, L{L}_v
+RoPE(L{L}_q, L{L}_k) -> L{L}_q_rot, L{L}_k_rot
+KV_Cache_Write(L{L}_k_rot, L{L}_v) -> L{L}_kv_cache        # 将当前步 K/V 追加到 kv_cache
+KV_Cache_Read(L{L}_kv_cache) -> L{L}_full_k, L{L}_full_v   # 读取全部历史 K/V（含当前步）
+Attn_Score(L{L}_q_rot, L{L}_full_k) -> L{L}_attn_scores
+Softmax(L{L}_attn_scores) -> L{L}_attn_probs
+Attn_Context(L{L}_attn_probs, L{L}_full_v) -> L{L}_attn_context
+O_proj(L{L}_attn_context, L{L}_o_proj_weight) -> L{L}_attn_output
+Residual1(L{L}_attn_output, L{L}_hidden_states) -> L{L}_h1
+LN2(L{L}_h1) -> L{L}_ln2_out
+FFN_gate(L{L}_ln2_out, L{L}_gate_weight) -> L{L}_gate_out   # 与 FFN_up 并行
+FFN_up(L{L}_ln2_out, L{L}_up_weight) -> L{L}_up_out
+SiLU(L{L}_gate_out, L{L}_up_out) -> L{L}_silu_out
+FFN_down(L{L}_silu_out, L{L}_down_weight) -> L{L}_mlp_output
+Residual2(L{L}_mlp_output, L{L}_h1) -> L{L}_layer_output
+第 L 层的 L{L}_layer_output 作为第 L+1 层的输入 L{L+1}_hidden_states。
+
+最终第 31 层的 L31_layer_output 作为全局 final_hidden 传入 LMHead：
+
+text
+LMHead(final_hidden, lm_head_weight) -> logits
+4. 中间数据缓存要求
+所有中间张量（上述列表中除权重、输入、输出、KV cache）均标记为 intermediates=True，不落盘但记录数据大小用于 local_read/write 计算。
+
+L{L}_kv_cache 必须作为非中间数据对象，持久缓存，大小随 kv_len 线性增长，且跨步保留内容。
+
+权重对象应支持分片（weight_shards），调度时需触发 ALL-GATHER。
+
+5. 常数成本表（decode 阶段，batch=1, seq=1）
+以下数值为除动态算子外所有算子的固定 flops、输入激活元素数、输出激活元素数、权重元素数。请直接填入对应的 Kernel.cost 中，不要使用 cost_fn（除非标记为动态）。
+
+算子	FLOPs	输入激活元素数	输出激活元素数	权重元素数	是否动态（KV）
+Embedding	0	1	4096	131,072,000	否
+LN1	20,480	4096	4096	0	否
+QKV_proj	100,663,296	4096	12288	50,331,648	否
+RoPE	24,576	8192	8192	0	否
+KV_Cache_Write	0	8192	8192（增量）	0	否（固定增量）
+KV_Cache_Read	0	-	-	0	是
+Attn_Score	-	-	-	0	是
+Softmax	-	-	-	0	是
+Attn_Context	-	-	-	0	是
+O_proj	33,554,432	4096	4096	16,777,216	否
+Residual1	0	8192	4096	0	否
+LN2	20,480	4096	4096	0	否
+FFN_gate	90,177,536	4096	11008	45,088,768	否
+FFN_up	90,177,536	4096	11008	45,088,768	否
+SiLU	33,024	22016	11008	0	否
+FFN_down	90,177,536	11008	4096	45,088,768	否
+Residual2	0	8192	4096	0	否
+LMHead	262,144,000	4096	32000	131,072,000	否
+表中“-”表示由 cost_fn(kv_len) 动态计算。KV_Cache_Write 虽标记为固定增量，但其写入数据量仅当前 token 的 K/V，不随 kv_len 增长。
+
+6. 动态成本函数要求
+对以下四个算子实现 cost_fn(kv_len)，返回 (compute_flops, memory_bytes)，使用 KV 长度 kv_len 作为变量。假设 KV cache 以 INT4 存储（每元素 0.5 字节），其他激活以 FP32（4 字节）参与计算。
+
+KV_Cache_Read
+FLOPs：0
+
+memory_bytes = kv_len * 32 * 128 * 2 * 0.5（K 和 V 各占一半，总和为 kv_len * 32 * 128 字节）
+
+Attn_Score
+FLOPs = 2 * 32 * 128 * kv_len = 8192 * kv_len
+
+memory_bytes = Q（32*128*4）+ K（kv_len*32*128*0.5）+ 输出（kv_len*32*4）
+
+Softmax
+FLOPs = 3 * 32 * kv_len = 96 * kv_len
+
+memory_bytes = 输入（kv_len*32*4）+ 输出（kv_len*32*4）
+
+Attn_Context
+FLOPs = 2 * 32 * 128 * kv_len = 8192 * kv_len
+
+memory_bytes = probs（kv_len*32*4）+ V（kv_len*32*128*0.5）+ 输出（32*128*4）
+
+7. 实施要求
+集中管理上述算子属性表和成本配置，避免散落硬编码。
+
+仅保留 LLaMA-7B 构建路径，移除其他模型支持代码。
+
+严格遵守模板复制展开机制，不得为每一层单独手写算子。
+
+确保数据对象命名、层前缀替换逻辑正确，层间连接无误。
+
+不要修改任何现有硬件能力、精度枚举、兼容性检查、效率表、性能计算或调度逻辑。
+
+8. 验证
+构建 LLaMA-7B 模型，打印 DAG 节点和边，确认 32 层结构正确，每层 16 个算子，全局算子 2 个，总计 514 个算子（32*16+2）。
+
+检查每个算子的 category、data_precision、execution_precision 字段设置正确。
+
+运行兼容性检查，输出 18×5 矩阵，确保每个算子至少能被一种硬件执行。
+
+确认 KV 动态算子在 kv_len=1 时成本不为零且合理，在 kv_len=2048 时按线性增长。
+
+验证模板复制机制：第 0 层和第 31 层算子 id 前缀正确，成本计算一致。
+
+9. 输出
+修改文件列表。
+
+新的算子 DAG 结构（含数据对象依赖和层间连接）。
+
+算子属性表。
+
+常数成本表。
+
+动态成本函数实现片段。
+
+模板复制实现说明。
+
+兼容性矩阵验证结果。
+
+各硬件支持的算子数量统计。

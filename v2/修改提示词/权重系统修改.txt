@@ -1,0 +1,75 @@
+任务目标
+算子划分已更新（新增 QKV_proj 等，删除 Attn_QK/Attn_AV，KVUpdate 改名等），但权重系统仍基于旧算子命名。请修改权重系统，使其正确关联到新的算子 ID，保持权重结构、数量、形状和分片规则不变。
+
+背景
+当前权重系统按层 + 全局组织 WeightBlock 字典。每层 5 个权重（qkv_weight、o_proj_weight、gate_weight、up_weight、down_weight），全局 2 个权重（embed_weight、lm_head_weight）。权重类别与分片规则：
+
+qkv_weight → W_attn，沿 cols 切分
+
+o_proj_weight → W_attn，沿 cols 切分
+
+gate_weight / up_weight / down_weight → W_mlp，沿 cols 切分
+
+embed_weight → W_embed，沿 rows 切分
+
+lm_head_weight → W_head，沿 rows 切分
+
+需要修改的内容
+更新 WeightBlock 的 consumers 和 input_slots 映射，使其指向新算子 ID：
+
+L{L}_qkv_weight → L{L}_qkv_proj，input_slot = 1（第 1 路权重输入）
+
+L{L}_o_proj_weight → L{L}_o_proj，input_slot = 1
+
+L{L}_gate_weight → L{L}_ffn_gate，input_slot = 1
+
+L{L}_up_weight → L{L}_ffn_up，input_slot = 1
+
+L{L}_down_weight → L{L}_ffn_down，input_slot = 1
+
+全局 embed_weight → Embedding，input_slot = 1
+
+全局 lm_head_weight → LMHead，input_slot = 1
+
+确保权重命名保持一致：权重对象名称仍然用上述名称（如 L{L}_qkv_weight），不要改变。
+
+更新任何按算子名匹配的逻辑：如果现有代码通过尾名映射类别（如 qkv_weight → W_attn），保持原样；但如果代码中通过旧算子名（如 Attn_QK）查找消费者，请改为新算子名。
+
+不要修改：
+
+权重形状（如 qkv_weight 仍为 12288×4096）
+
+权重数量（每层 5 个，共 160 层内 + 2 全局）
+
+分片规则（split_dim 仍为 cols 或 rows）
+
+WeightBlock 数据结构
+
+WeightPartition 生成逻辑
+
+调度器 ALL-GATHER 逻辑
+
+验证要求
+构建 LLaMA-7B 模型后，检查权重块总数仍为 162（160 层内 + 2 全局）。
+
+抽查第 0 层和第 31 层：
+
+L0_qkv_weight 的 consumers 是否包含 L0_qkv_proj，input_slots 是否正确。
+
+L31_down_weight 的 consumers 是否包含 L31_ffn_down。
+
+全局权重：
+
+embed_weight 的 consumers 包含 Embedding。
+
+lm_head_weight 的 consumers 包含 LMHead。
+
+确认分片后，调度时 ALL-GATHER 事件正常触发，且目标设备能正确获取权重分片。
+
+输出
+修改文件列表。
+
+权重系统变更说明（消费者映射更新前后对比）。
+
+验证结果（权重块总数、抽查结果）。
+

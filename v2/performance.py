@@ -17,10 +17,12 @@ class PerformanceModel:
         self.interconnect = interconnect  # Interconnect
 
     def can_execute(self, op: Operator, hw_id: str) -> bool:
+        """统一 Hardware → Operator 兼容性门控（复用 hardware.can_execute）。
+        不修改任何性能计算公式；仅把精度/类别是否可执行委托给统一接口。"""
         hw = self.hw.get(hw_id)
         if hw is None:
             return False
-        return hw.supports_precision(op.required_precision)
+        return hw.can_execute(op)
 
     def compute_time_ns(self, op: Operator, hw_id: str) -> int:
         hw = self.hw.get(hw_id)

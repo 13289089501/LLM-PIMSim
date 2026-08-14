@@ -1,6 +1,6 @@
 experiment:
   name: 03_my_pim_study
-  model: qwen7b
+  model: llama7b
   seed: 42
   files:
     hardware: 03_my_pim_study_hardware.yaml

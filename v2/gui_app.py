@@ -453,11 +453,7 @@ def _map_weight_devices(weight_blocks, hardware):
 def api_workload():
     model = request.args.get("model","llama7b")
     MODELS = {
-        "tiny":    dict(hidden=512, ffn=2048, heads=8, head_dim=64, vocab=10000, layers=1, seq=128),
         "llama7b": dict(hidden=4096, ffn=11008, heads=32, head_dim=128, vocab=32000, layers=32, seq=2048),
-        "llama13b":dict(hidden=5120, ffn=13824, heads=40, head_dim=128, vocab=32000, layers=40, seq=2048),
-        "llama70b":dict(hidden=8192, ffn=28672, heads=64, head_dim=128, vocab=32000, layers=80, seq=2048),
-        "qwen7b":  dict(hidden=4096, ffn=11008, heads=32, head_dim=128, vocab=151936, layers=32, seq=2048),
     }
     m = MODELS.get(model, MODELS["llama7b"])
     from workload_model import build_model_workload
@@ -484,11 +480,7 @@ def api_split():
     if not dim or not isinstance(parts, list) or not len(parts):
         return jsonify({"error": "需要 dim 和 parts"}), 400
     # 从 workload 找到该 kernel
-    MODELS = {"tiny":[512,2048,8,64,10000,1,128],
-              "llama7b":[4096,11008,32,128,32000,32,2048],
-              "llama13b":[5120,13824,40,128,32000,40,2048],
-              "llama70b":[8192,28672,64,128,32000,80,2048],
-              "qwen7b":[4096,11008,32,128,151936,32,2048]}
+    MODELS = {"llama7b":[4096,11008,32,128,32000,32,2048]}
     m = MODELS.get(model, MODELS["llama7b"])
     from workload_model import build_model_workload
     wl = build_model_workload(hidden=m[0], ffn_size=m[1], num_heads=m[2],
@@ -527,11 +519,7 @@ def api_weights():
     split_arg = request.args.get("split", "")     # "W_mlp:2,W_attn:4"
     exp_path = (request.args.get("experiment") or "experiments/01_gpu_only.yaml").strip()
     MODELS = {
-        "tiny":    dict(hidden=512, ffn=2048, heads=8,  vocab=10000, layers=1),
         "llama7b": dict(hidden=4096, ffn=11008, heads=32, vocab=32000, layers=32),
-        "llama13b":dict(hidden=5120, ffn=13824, heads=40, vocab=32000, layers=40),
-        "llama70b":dict(hidden=8192, ffn=28672, heads=64, vocab=32000, layers=80),
-        "qwen7b":  dict(hidden=4096, ffn=11008, heads=32, vocab=151936, layers=32),
     }
     m = MODELS.get(model, MODELS["llama7b"])
     class_split = {}
@@ -733,10 +721,6 @@ body{font:13px/1.5 system-ui,sans-serif;background:var(--bg);color:var(--text);d
     <label>模型</label>
     <select id="sel-model" onchange="loadModel()">
       <option value="llama7b">LLaMA-7B</option>
-      <option value="llama13b">LLaMA-13B</option>
-      <option value="llama70b">LLaMA-70B</option>
-      <option value="qwen7b">Qwen-7B</option>
-      <option value="tiny">Tiny（测试用）</option>
     </select>
   </div>
 
@@ -1618,7 +1602,7 @@ function openNewExperiment(){
   // 填充模型下拉
   let msel=document.getElementById('new-exp-model');
   msel.innerHTML='';
-  ['llama7b','llama13b','llama70b','qwen7b','tiny'].forEach(id=>{
+  ['llama7b'].forEach(id=>{
     let o=document.createElement('option'); o.value=id; o.textContent=id; msel.appendChild(o);
   });
   // 填充"克隆自"下拉（与实验下拉一致，默认选中当前实验）

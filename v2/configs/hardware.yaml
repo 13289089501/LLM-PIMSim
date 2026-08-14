@@ -1,13 +1,31 @@
 # hardware.yaml — 硬件清单（配置驱动）
 # 想加硬件: 在 devices 加一段；想删: 删一段；改参数: 覆盖字段即可。
 # type 决定"出厂预设"，下面字段覆盖预设；不写就用出厂值。
+# ============ 数据来源（硬件校准） ============
+#   CPU       : Intel Xeon Platinum 8480+ (Sapphire Rapids), DDR5-4800, BF16 AMX
+#   GPU       : NVIDIA A100 80GB SXM, BF16/FP16 Tensor Core dense(不含 sparsity)
+#   SRAM-PIM  : 7nm SRAM-CIM, ISSCC 类代表值
+#   DRAM-PIM  : Samsung HBM2-PIM Aquabolt-XL (单 stack)
+#   ReRAM-PIM : NeuRRAM/RRAM-CIM, Nature 2023 类代表值（读写不对称）
+# 单位: peak_tflops 自动 ×1e12 → FLOPS；带宽 GB/s 自动 ×1e9 → Bps；容量 GB/MB 自动转 Byte；延迟 ns。
 
 devices:
+  - id: cpu0
+    type: CPU
+    compute:
+      peak_tflops: 45.9          # BF16 AMX 峰值
+      parallelism: 1
+    memory:
+      capacity_gb: 512
+      read_bandwidth_gbs: 307.2
+      write_bandwidth_gbs: 307.2
+      read_latency_ns: 90
+      write_latency_ns: 90
+
   - id: gpu0
     type: GPU
-    # supported_precision: [FP32, FP16, INT8, INT4]   # 可选：限制该硬件能算哪些精度
     compute:
-      peak_tflops: 300          # GPU 算力（人话单位，自动换算）
+      peak_tflops: 312           # A100 dense BF16/FP16 Tensor Core 主峰值
       parallelism: 100
     efficiency:                 # 同一硬件对不同算子效率不同
       GEMM: 0.85
@@ -16,55 +34,75 @@ devices:
       LayerNorm: 0.25
     memory:
       capacity_gb: 80
-      read_bandwidth_gbs: 2000
-      write_bandwidth_gbs: 1800
-      read_latency_ns: 100
-      write_latency_ns: 100
+      read_bandwidth_gbs: 2039
+      write_bandwidth_gbs: 2039
+      read_latency_ns: 400
+      write_latency_ns: 400
 
   - id: pim0
     type: DRAM_PIM
-    # 默认支持全部四种精度。要做"低精度PIM研究"可这样限制：
-    # supported_precision: [INT8, INT4]
     compute:
-      peak_tops: 50             # PIM 用 TOPS 写
+      peak_tflops: 1.2           # FP16（单 stack 代表值）
+      parallelism: 16
     efficiency:
       GEMM: 0.70
       Attention: 0.40
       Softmax: 0.20
       LayerNorm: 0.15
     memory:
-      capacity_gb: 512
-      read_bandwidth_gbs: 800
-      write_bandwidth_gbs: 600
+      capacity_gb: 8
+      read_bandwidth_gbs: 307.2
+      write_bandwidth_gbs: 307.2
       read_latency_ns: 50
-      write_latency_ns: 80
+      write_latency_ns: 50
 
   - id: sram0
     type: SRAM_PIM
-    # 高带宽近存计算：归一化/Softmax/激活等归约+逐元素算子的首选（FP32 累加精度稳）
     compute:
-      peak_tops: 200
+      peak_tflops: 500           # FP16/BF16
+      parallelism: 32
     efficiency:
-      GEMM: 0.40
-      Attention: 0.35
-      Softmax: 0.60
-      LayerNorm: 0.55
-      Activation: 0.60
-      Residual: 0.60
+      GEMM: 0.80
+      Attention: 0.50
+      Softmax: 0.30
+      LayerNorm: 0.25
     memory:
-      capacity_mb: 128
-      read_bandwidth_gbs: 4000
-      write_bandwidth_gbs: 3000
-      read_latency_ns: 20
-      write_latency_ns: 20
+      capacity_mb: 512
+      read_bandwidth_gbs: 1500000   # 1.5 PB/s
+      write_bandwidth_gbs: 1500000
+      read_latency_ns: 2
+      write_latency_ns: 2
+
+  - id: rram0
+    type: RERAM_PIM
+    compute:
+      peak_tflops: 20            # INT8
+      parallelism: 64
+    efficiency:
+      GEMM: 0.60
+      Attention: 0.30
+      Softmax: 0.10
+      LayerNorm: 0.10
+    memory:
+      capacity_mb: 64
+      read_bandwidth_gbs: 128
+      write_bandwidth_gbs: 32
+      read_latency_ns: 10
+      write_latency_ns: 100
 
 # ============================================================
-# 精度模型说明（v2.1 新增）
-# 四种精度模式，数值=等级（越大精度越高）：
-#   FP32 = 4 (最高)   FP16 = 3 (BF16同档)   INT8 = 2   INT4 = 1 (最低)
-# 兼容规则: 硬件支持的最高精度等级 >= 算子要求的精度等级，才允许计算。
-#   例如: 若某 PIM 只支持 [INT8, INT4]，则 FP16 算子不能映射到它（精度不匹配）。
-# 硬件默认支持全部四种；用 supported_precision 字段可缩小。
-# 算子精度由模型决定（默认 FP16），后续可在 mapping/模型层调整。
-# HIGH/LOW 语义仍可用: HIGH≈FP16及以上, LOW≈INT8及以下。
+# 精度与峰值算力
+# 精度系统（合同 precisions.py / contracts.PrecisionLevel）固定 6 种：
+#   INT4 < INT8 < FP8 < FP16 < BF16 < FP32（按精度等级排序）
+# 峰值算力：
+#   新格式 compute.peak_throughput: {FP16:{value,unit}, INT8:{value,unit}, ...}
+#   可为不同精度配不同算力；key 即该硬件“真正配置支持”的精度（单一事实来源）。
+#   旧格式 compute.peak_tflops / peak_tops 单值：会自动填到默认全部精度
+#   （本文件当前用单值主峰值，主推理精度对应值）。
+# 支持的精度：
+#   - 运行时“能否执行某算子”由 precisions.py 的固定三维 Capability 判定（can_execute）。
+#   - 本文件的 supported_precision / peak_throughput 仅作配置层声明，不影响 can_execute。
+# 注意：任务给出的部分“支持精度”（如 GPU 的 FP64/TF32）不在 6 种精度枚举内，
+#   因此不会出现在配置层；如需表达，请以 precisions.py 的固定 Capability 为准。
+# 算子精度由模型决定（默认 FP16）。
 # ============================================================

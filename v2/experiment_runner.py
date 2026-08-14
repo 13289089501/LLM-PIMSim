@@ -266,13 +266,9 @@ def _resolve_model_dims(ing) -> dict:
     # 尝试从 已加载的 ExperimentConfig 找维度（此处接入 config 的 workload 段）
     # 为兼容当前 config_loader，先回退到内置模型参数表
     _MODEL_DIMS = {
-        "tiny":    dict(num_layers=1,  hidden=512,  ffn_size=2048, num_heads=8,  head_dim=64,  vocab=10000,  pbytes=2),
         "llama7b": dict(num_layers=32, hidden=4096, ffn_size=11008, num_heads=32, head_dim=128, vocab=32000, pbytes=2),
-        "llama13b":dict(num_layers=40, hidden=5120, ffn_size=13824, num_heads=40, head_dim=128, vocab=32000, pbytes=2),
-        "llama70b":dict(num_layers=80, hidden=8192, ffn_size=28672, num_heads=64, head_dim=128, vocab=32000, pbytes=2),
-        "qwen7b":  dict(num_layers=32, hidden=4096, ffn_size=11008, num_heads=32, head_dim=128, vocab=151936, pbytes=2),
     }
-    dims = dict(_MODEL_DIMS.get(ing.model, _MODEL_DIMS["tiny"]))
+    dims = dict(_MODEL_DIMS.get(ing.model, _MODEL_DIMS["llama7b"]))
     dims["input_tokens"] = 2048
     dims["decode_steps"] = 128
     return dims

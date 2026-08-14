@@ -41,6 +41,7 @@ class HardwareFactory:
                 name=hid,
                 device_type=_DEVICE_TYPE_MAP.get(hc.type, DeviceType.GPU),
                 peak_compute_flops=hc.peak_f,
+                peak_throughput_by_precision=dict(hc.peak_by_precision),
                 memory_capacity_bytes=hc.mem_bytes,
                 read_bandwidth_Bps=hc.read_bw,
                 write_bandwidth_Bps=hc.write_bw,

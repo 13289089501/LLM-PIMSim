@@ -1,0 +1,1063 @@
+你现在需要在现有 LLM-PIMSim 项目中实现并接入一套完整的 Precision & Operator Category System（精度与算子类别系统）。
+
+请先阅读工作目录中已有的项目设计文档和现有代码，理解当前的数据结构和模块关系，然后自行完成代码修改。
+
+本次任务中的所有精度、算子类别和硬件能力已经确定。你不需要调研，也不允许自行修改这些固定规则。
+
+注意：
+
+- 不要大规模重构无关代码。
+- 不要修改现有 Operator Efficiency。
+- 不要修改现有 Operator Efficiency 的数据结构和计算逻辑。
+- 不要修改现有性能计算公式。
+- 不要修改 Compute Time 计算逻辑。
+- 不要修改数据大小、存储容量和数据移动量计算逻辑。
+- 不要修改数据移动延迟计算公式。
+- 不要修改调度算法和离散事件仿真核心逻辑。
+- 本次只负责新增和接入 Precision System、Operator Category System，以及 Hardware → Operator 兼容性校验。
+
+==================================================
+一、实施前必须先检查现有项目
+==================================================
+
+开始修改前，请先阅读现有代码和工作目录中的设计文档，确认：
+
+1. Operator 的定义位置。
+2. Hardware 的定义位置。
+3. 当前 Precision 或类似精度字段的定义位置。
+4. model_lib.py 中模型的构建方式。
+5. 当前支持的模型构建方式。
+6. 当前 15 类算子的创建位置。
+7. 算子添加到设备、映射到设备或进入调度流程的位置。
+8. 当前是否已经存在 Hardware Capability 或类似能力校验。
+9. 当前配置文件和硬件参数的组织方式。
+10. 哪些位置最适合接入统一的兼容性检查。
+
+不要因为本提示词中的示例命名与现有项目不同就强制修改项目结构。应尽量按照现有项目风格进行最小修改。
+
+==================================================
+二、Precision 类型
+==================================================
+
+本项目固定支持以下 6 种 Precision：
+
+- FP32
+- BF16
+- FP16
+- FP8
+- INT8
+- INT4
+
+不要添加：
+
+- FP64
+- TF32
+- INT2
+
+Precision 类型必须具有明确语义。
+
+不要简单设计为：
+
+FP32.value = 32
+FP16.value = 16
+
+然后只依赖 bit width 判断兼容性。
+
+请使用统一的 Precision 枚举或等价数据结构，并保留良好的扩展能力。
+
+当前 6 种 Precision：
+
+FP32
+BF16
+FP16
+FP8
+INT8
+INT4
+
+均可以作为：
+
+- data_precision
+- execution_precision
+
+但 execution_precision 额外允许为 None。
+
+None 不是一种 Precision。
+
+不要创建：
+
+- N/A
+- NONE
+- UNKNOWN
+
+等假的 Precision 枚举值。
+
+==================================================
+三、Operator 双精度字段
+==================================================
+
+所有 Operator 必须具有：
+
+- data_precision
+- execution_precision
+
+语义固定如下：
+
+data_precision：
+
+表示算子处理和产生的数据精度。
+
+execution_precision：
+
+表示算子实际执行计算所要求的计算精度。
+
+两者必须独立：
+
+data_precision != execution_precision
+
+是允许且正常的情况。
+
+例如：
+
+data_precision = FP16
+execution_precision = FP32
+
+是合法的。
+
+execution_precision 的类型概念上应为：
+
+Precision | None
+
+但请根据项目实际 Python 版本选择兼容写法。
+
+对于纯数据访问/更新型算子：
+
+execution_precision = None
+
+当前只有以下两个算子固定使用 None：
+
+Embedding
+KVUpdate
+
+==================================================
+四、Operator Category 类型
+==================================================
+
+新增统一的 OperatorCategory 类型或等价实现。
+
+当前固定只有两类：
+
+- LINEAR
+- NONLINEAR
+
+每个 Operator 必须拥有：
+
+category
+
+即概念上：
+
+Operator
+├── category
+├── data_precision
+└── execution_precision
+
+不要新增其他 Category。
+
+不要自行增加：
+
+- MEMORY
+- COMPUTE
+- DIGITAL
+- ANALOG
+
+等类别。
+
+当前系统只使用：
+
+LINEAR
+NONLINEAR
+
+==================================================
+五、15 个算子的固定 Category 和 Precision
+==================================================
+
+以下参数已经最终确定。
+
+不要调研。
+不要修改。
+不要根据自己的判断替换。
+不要使用“当前模型默认精度”。
+不要新增模型级 Precision 配置。
+
+必须严格按以下规则设置。
+
+--------------------------------------------------
+1. Embedding
+--------------------------------------------------
+
+category:
+LINEAR
+
+data_precision:
+FP16
+
+execution_precision:
+None
+
+--------------------------------------------------
+2. LN1
+--------------------------------------------------
+
+category:
+NONLINEAR
+
+data_precision:
+FP16
+
+execution_precision:
+FP32
+
+--------------------------------------------------
+3. Attn_QK
+--------------------------------------------------
+
+category:
+LINEAR
+
+data_precision:
+INT8
+
+execution_precision:
+INT8
+
+--------------------------------------------------
+4. Softmax
+--------------------------------------------------
+
+category:
+NONLINEAR
+
+data_precision:
+FP16
+
+execution_precision:
+FP32
+
+--------------------------------------------------
+5. Attn_AV
+--------------------------------------------------
+
+category:
+LINEAR
+
+data_precision:
+INT8
+
+execution_precision:
+INT8
+
+--------------------------------------------------
+6. O_proj
+--------------------------------------------------
+
+category:
+LINEAR
+
+data_precision:
+INT8
+
+execution_precision:
+INT8
+
+--------------------------------------------------
+7. Residual1
+--------------------------------------------------
+
+category:
+LINEAR
+
+data_precision:
+FP16
+
+execution_precision:
+FP16
+
+--------------------------------------------------
+8. LN2
+--------------------------------------------------
+
+category:
+NONLINEAR
+
+data_precision:
+FP16
+
+execution_precision:
+FP32
+
+--------------------------------------------------
+9. FFN_gate
+--------------------------------------------------
+
+category:
+LINEAR
+
+data_precision:
+INT8
+
+execution_precision:
+INT8
+
+--------------------------------------------------
+10. FFN_up
+--------------------------------------------------
+
+category:
+LINEAR
+
+data_precision:
+INT8
+
+execution_precision:
+INT8
+
+--------------------------------------------------
+11. SiLU
+--------------------------------------------------
+
+category:
+NONLINEAR
+
+data_precision:
+BF16
+
+execution_precision:
+BF16
+
+--------------------------------------------------
+12. FFN_down
+--------------------------------------------------
+
+category:
+LINEAR
+
+data_precision:
+INT8
+
+execution_precision:
+INT8
+
+--------------------------------------------------
+13. Residual2
+--------------------------------------------------
+
+category:
+LINEAR
+
+data_precision:
+FP16
+
+execution_precision:
+FP16
+
+--------------------------------------------------
+14. KVUpdate
+--------------------------------------------------
+
+category:
+LINEAR
+
+data_precision:
+INT4
+
+execution_precision:
+None
+
+--------------------------------------------------
+15. LMHead
+--------------------------------------------------
+
+category:
+LINEAR
+
+data_precision:
+FP8
+
+execution_precision:
+FP8
+
+==================================================
+六、模型构建要求
+==================================================
+
+当前项目必须继续能够成功构建：
+
+- tiny
+- llama7b
+- llama13b
+- llama70b
+- qwen7b
+
+这些模型中出现的对应 Operator 必须全部正确拥有：
+
+- category
+- data_precision
+- execution_precision
+
+不要新增：
+
+- model_precision
+- kv_cache_precision
+
+不要建立模型级统一 Precision 配置系统。
+
+不要让 Agent 自行根据模型参数决定上述 15 个算子的 Precision。
+
+上述 15 类算子的 Precision 和 Category 是固定规则。
+
+请将这些规则设计为统一、集中、可维护的方式。
+
+不要在多个模型构建函数中大量散乱复制相同硬编码。
+
+可以建立统一的算子属性规则表、映射表或等价机制，但应遵循现有项目代码风格。
+
+==================================================
+七、Hardware Capability
+==================================================
+
+每个 Hardware 必须独立描述以下三类能力：
+
+1. supported_operator_categories
+2. supported_data_precisions
+3. supported_execution_precisions
+
+概念结构如下：
+
+Hardware Capability
+├── supported_operator_categories
+├── supported_data_precisions
+└── supported_execution_precisions
+
+不要继续只使用一个简单的：
+
+supported_precision
+
+代替以上三种能力。
+
+如果旧代码存在单一 Precision 字段，请谨慎兼容。
+
+不要无理由破坏现有代码。
+
+==================================================
+八、五种硬件的固定 Capability
+==================================================
+
+以下硬件能力已经最终确定。
+
+不要调研。
+不要自行增加能力。
+不要修改。
+必须严格按照以下配置实现。
+
+--------------------------------------------------
+1. CPU
+--------------------------------------------------
+
+supported_operator_categories:
+
+- LINEAR
+- NONLINEAR
+
+supported_data_precisions:
+
+- FP32
+- BF16
+- FP16
+- INT8
+- INT4
+
+supported_execution_precisions:
+
+- FP32
+- BF16
+- FP16
+- INT8
+
+--------------------------------------------------
+2. GPU
+--------------------------------------------------
+
+supported_operator_categories:
+
+- LINEAR
+
+supported_data_precisions:
+
+- FP32
+- BF16
+- FP16
+- INT8
+
+supported_execution_precisions:
+
+- FP32
+- BF16
+- FP16
+- INT8
+
+GPU 不支持：
+
+- NONLINEAR
+- FP8 data
+- FP8 execution
+- INT4 data
+- INT4 execution
+
+--------------------------------------------------
+3. SRAM-PIM
+--------------------------------------------------
+
+supported_operator_categories:
+
+- LINEAR
+- NONLINEAR
+
+supported_data_precisions:
+
+- BF16
+- FP16
+- INT8
+- INT4
+
+supported_execution_precisions:
+
+- BF16
+- FP16
+- INT8
+
+SRAM-PIM 不支持：
+
+- FP32 data
+- FP32 execution
+- FP8 data
+- FP8 execution
+- INT4 execution
+
+--------------------------------------------------
+4. DRAM-PIM
+--------------------------------------------------
+
+supported_operator_categories:
+
+- LINEAR
+
+supported_data_precisions:
+
+- BF16
+- FP16
+- INT8
+- INT4
+
+supported_execution_precisions:
+
+- BF16
+- FP16
+- INT8
+
+DRAM-PIM 不支持：
+
+- NONLINEAR
+- FP32 data
+- FP32 execution
+- FP8 data
+- FP8 execution
+- INT4 execution
+
+--------------------------------------------------
+5. ReRAM-PIM
+--------------------------------------------------
+
+supported_operator_categories:
+
+- LINEAR
+- NONLINEAR
+
+supported_data_precisions:
+
+- BF16
+- FP16
+- FP8
+- INT8
+- INT4
+
+supported_execution_precisions:
+
+- BF16
+- FP16
+- FP8
+- INT8
+
+ReRAM-PIM 不支持：
+
+- FP32 data
+- FP32 execution
+- INT4 execution
+
+==================================================
+九、统一兼容性校验
+==================================================
+
+必须实现统一的 Hardware → Operator 兼容性判断接口。
+
+建议名称：
+
+hardware.can_execute(operator)
+
+如果现有项目命名风格不适合，可以采用其他合理名称。
+
+但必须只有一个统一的核心入口。
+
+不要在：
+
+- 映射模块
+- 调度模块
+- 设备队列模块
+
+分别重复实现相同的 Precision 和 Category 判断逻辑。
+
+==================================================
+十、兼容性判断规则
+==================================================
+
+一个 Operator 只有同时满足以下条件，才能映射到 Hardware。
+
+------------------------------
+条件 1：Category Compatible
+------------------------------
+
+operator.category
+
+必须属于：
+
+hardware.supported_operator_categories
+
+即：
+
+operator.category
+in
+hardware.supported_operator_categories
+
+------------------------------
+条件 2：Data Precision Compatible
+------------------------------
+
+operator.data_precision
+
+必须属于：
+
+hardware.supported_data_precisions
+
+即：
+
+operator.data_precision
+in
+hardware.supported_data_precisions
+
+------------------------------
+条件 3：Execution Precision Compatible
+------------------------------
+
+如果：
+
+operator.execution_precision != None
+
+则：
+
+operator.execution_precision
+in
+hardware.supported_execution_precisions
+
+必须成立。
+
+--------------------------------------------------
+普通计算算子最终规则
+--------------------------------------------------
+
+Can Execute
+=
+Category Compatible
+AND
+Data Precision Compatible
+AND
+Execution Precision Compatible
+
+--------------------------------------------------
+execution_precision = None 的算子
+--------------------------------------------------
+
+对于：
+
+Embedding
+KVUpdate
+
+规则为：
+
+Can Execute
+=
+Category Compatible
+AND
+Data Precision Compatible
+
+不要检查 execution_precision。
+
+==================================================
+十一、精度或类别不兼容时的处理
+==================================================
+
+如果 Hardware 与 Operator 不兼容：
+
+- 不允许映射。
+- 不允许加入该设备的执行队列。
+- 不允许作为调度候选设备。
+- 返回明确失败结果，或抛出明确异常，具体遵循现有项目风格。
+
+错误信息或失败原因应尽可能明确指出：
+
+1. Operator 名称。
+2. Operator Category。
+3. Operator data_precision。
+4. Operator execution_precision。
+5. Hardware 支持的 Categories。
+6. Hardware 支持的 Data Precisions。
+7. Hardware 支持的 Execution Precisions。
+8. 具体是哪一项不兼容。
+
+例如：
+
+Category incompatible
+
+或：
+
+Data precision FP8 is not supported
+
+或：
+
+Execution precision FP32 is not supported
+
+不要只返回：
+
+False
+
+而完全无法得知失败原因。
+
+可以设计：
+
+can_execute(operator) -> bool
+
+同时提供：
+
+check_execution_compatibility(operator)
+
+返回详细结果。
+
+也可以使用现有项目更合适的结构。
+
+但所有映射和调度前的合法性判断必须最终复用同一个核心兼容性逻辑。
+
+==================================================
+十二、最终兼容性结果必须满足
+==================================================
+
+实现完成后，以下兼容关系必须成立。
+
+| Operator | CPU | GPU | SRAM-PIM | DRAM-PIM | ReRAM-PIM |
+|---|---|---|---|---|---|
+| Embedding | ✓ | ✓ | ✓ | ✓ | ✓ |
+| LN1 | ✓ | ✗ | ✗ | ✗ | ✗ |
+| Attn_QK | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Softmax | ✓ | ✗ | ✗ | ✗ | ✗ |
+| Attn_AV | ✓ | ✓ | ✓ | ✓ | ✓ |
+| O_proj | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Residual1 | ✓ | ✓ | ✓ | ✓ | ✓ |
+| LN2 | ✓ | ✗ | ✗ | ✗ | ✗ |
+| FFN_gate | ✓ | ✓ | ✓ | ✓ | ✓ |
+| FFN_up | ✓ | ✓ | ✓ | ✓ | ✓ |
+| SiLU | ✓ | ✗ | ✓ | ✗ | ✓ |
+| FFN_down | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Residual2 | ✓ | ✓ | ✓ | ✓ | ✓ |
+| KVUpdate | ✓ | ✗ | ✓ | ✓ | ✓ |
+| LMHead | ✗ | ✗ | ✗ | ✗ | ✓ |
+
+必须编写或执行验证，确认上述矩阵全部成立。
+
+==================================================
+十三、特别禁止修改的内容
+==================================================
+
+本次严禁修改以下内容：
+
+1. Operator Efficiency。
+2. Operator Efficiency 数据结构。
+3. Operator Efficiency 计算逻辑。
+4. Peak Compute 或 Peak Throughput 的性能计算逻辑。
+5. Compute Time 计算公式。
+6. 数据大小计算逻辑。
+7. data_precision 到数据字节数的换算。
+8. 存储容量计算。
+9. 数据移动量计算。
+10. 数据移动读写延迟计算公式。
+11. 调度算法。
+12. 调度策略。
+13. 离散事件仿真核心逻辑。
+14. 模型级 model_precision。
+15. 模型级 kv_cache_precision。
+16. 自动量化逻辑。
+17. 根据 Hardware 自动修改 Operator Precision 的逻辑。
+
+特别强调：
+
+虽然本次新增：
+
+data_precision
+
+但暂时不要让它参与：
+
+数据元素大小
+→ 存储容量
+→ 数据传输量
+→ 读写时间
+
+这些将在后续单独修改。
+
+==================================================
+十四、实施步骤
+==================================================
+
+请严格按照以下顺序执行。
+
+第一步：
+
+阅读现有项目代码和工作目录设计文档。
+
+第二步：
+
+先用文字简要说明：
+
+1. 将修改哪些文件。
+2. 将新增哪些文件。
+3. Precision 类型准备放在哪里。
+4. OperatorCategory 类型准备放在哪里。
+5. Operator 双精度字段如何接入。
+6. 15 个算子的固定规则如何集中管理。
+7. Hardware 三类 Capability 如何保存。
+8. 统一兼容性检查接口放在哪里。
+9. 哪些现有模块会调用该接口。
+10. 如何保证不修改 Operator Efficiency 和性能计算逻辑。
+
+完成说明后再开始实际修改代码。
+
+第三步：
+
+实施代码修改。
+
+第四步：
+
+进行验证。
+
+==================================================
+十五、最低验证要求
+==================================================
+
+至少验证以下情况。
+
+A. Category、Data、Execution 全部兼容
+
+Operator：
+
+category = NONLINEAR
+data_precision = FP16
+execution_precision = FP32
+
+Hardware：
+
+supported_operator_categories =
+    NONLINEAR
+
+supported_data_precisions =
+    FP16
+
+supported_execution_precisions =
+    FP32
+
+结果：
+
+允许执行。
+
+--------------------------------------------------
+
+B. Category 不兼容
+
+Operator：
+
+category = NONLINEAR
+data_precision = FP16
+execution_precision = FP32
+
+Hardware：
+
+supported_operator_categories =
+    LINEAR
+
+supported_data_precisions =
+    FP16
+
+supported_execution_precisions =
+    FP32
+
+结果：
+
+不允许执行。
+
+--------------------------------------------------
+
+C. Data Precision 不兼容
+
+Operator：
+
+category = LINEAR
+data_precision = FP8
+execution_precision = FP16
+
+Hardware：
+
+supported_operator_categories =
+    LINEAR
+
+supported_data_precisions =
+    FP16
+
+supported_execution_precisions =
+    FP16
+
+结果：
+
+不允许执行。
+
+--------------------------------------------------
+
+D. Execution Precision 不兼容
+
+Operator：
+
+category = LINEAR
+data_precision = FP16
+execution_precision = FP32
+
+Hardware：
+
+supported_operator_categories =
+    LINEAR
+
+supported_data_precisions =
+    FP16
+
+supported_execution_precisions =
+    FP16
+
+结果：
+
+不允许执行。
+
+--------------------------------------------------
+
+E. execution_precision = None
+
+Operator：
+
+category = LINEAR
+data_precision = INT4
+execution_precision = None
+
+Hardware：
+
+supported_operator_categories =
+    LINEAR
+
+supported_data_precisions =
+    INT4
+
+supported_execution_precisions =
+    空集合
+
+结果：
+
+允许执行。
+
+--------------------------------------------------
+
+F. GPU 非线性算子校验
+
+GPU 必须不能执行：
+
+LN1
+Softmax
+LN2
+SiLU
+
+即使 Precision 满足，也必须因为：
+
+NONLINEAR Category 不支持
+
+而拒绝执行。
+
+--------------------------------------------------
+
+G. 最终 15 × 5 兼容矩阵
+
+必须验证上一节给出的全部兼容结果。
+
+==================================================
+十六、完成后输出
+==================================================
+
+完成代码修改和验证后，请输出：
+
+1. 实际修改的文件列表。
+2. 实际新增的文件列表。
+3. 每个文件的主要修改内容。
+4. 最终 Precision 数据结构。
+5. 最终 OperatorCategory 数据结构。
+6. 最终 Operator 的三个字段：
+   - category
+   - data_precision
+   - execution_precision
+7. 15 个算子的最终配置。
+8. 最终 Hardware Capability 数据结构。
+9. 五种硬件的最终 Capability 配置。
+10. 统一兼容性检查接口。
+11. 兼容性检查接口的实际调用位置。
+12. 验证结果。
+13. 15 × 5 最终兼容矩阵验证结果。
+14. 仍然存在的兼容性问题或后续建议。
+
+再次强调：
+
+所有 Precision、Operator Category 和 Hardware Capability 已经确定。
+
+不要自行调研。
+不要自行修改固定参数。
+不要重新设计精度方案。
+
+Agent 的任务只是：
+
+严格按照本提示词规定的固定规则，
+在现有 LLM-PIMSim 项目中正确实现并接入：
+
+Precision System
++
+Operator Category System
++
+Operator 双精度字段
++
+Hardware 三维 Capability
++
+统一 Hardware → Operator 兼容性校验。

@@ -1,21 +1,25 @@
 """
 LLM-PIMSim v1 — 内置模型库
 用户只需选名字，所有算子自动生成。
-当前支持: llama7b, llama13b, llama70b, qwen7b, 以及用于快速测试的 tiny
+当前支持: llama7b
 
 每个模型输出:
   - operators: list[Operator]  (算子 DAG)
   - data_objects: list[DataObject]  (数据目录)
   - config dict (供报告使用)
 """
-from contracts import DataObject, DataType, Operator, PrecisionLevel
+from contracts import DataObject, DataType, Operator, PrecisionLevel, OperatorCategory
+from precisions import categorize_fallback
 
 
 def _builder_precision_to_bytes(precision) -> int:
     """按精度等级决定数据字节数: FP32=4, FP16=2, INT8=1, INT4=0.5(取整1)"""
     from contracts import PrecisionLevel
     try:
-        level = precision.level if isinstance(precision, PrecisionLevel) else PrecisionLevel.from_name(precision)
+        if isinstance(precision, PrecisionLevel):
+            level = precision
+        else:
+            level = PrecisionLevel.from_name(precision)
     except Exception:
         level = PrecisionLevel.FP16
     if level == PrecisionLevel.FP32:
@@ -47,8 +51,13 @@ def _build_llama_like(name: str, num_layers: int, hidden_size: int, ffn_size: in
         return d
 
     def make_op(op_id, oname, otype, flops_val, inputs, outputs, shape=""):
+        # 精度与算子类别（v2.3）：按 op_type 归类类别，双精度取模型精度
+        cat, data_prec, exec_prec = categorize_fallback(oname, otype, req_precision)
         o = Operator(id=op_id, name=oname, op_type=otype, flops=flops_val,
                      required_precision=req_precision,
+                     category=cat,
+                     data_precision=data_prec,
+                     execution_precision=exec_prec,
                      input_ids=list(inputs), output_ids=list(outputs),
                      shape_desc=shape)
         ops.append(o)
@@ -207,29 +216,13 @@ def _register(name: str, builder_func, **kwargs):
     QUERYABLE_MODELS[name] = lambda: builder_func(name=name, **kwargs)
 
 
-_register("tiny", _build_llama_like,
-          num_layers=1, hidden_size=512, ffn_size=2048, num_heads=8, head_dim=64,
-          vocab_size=10000, max_seq_len=128)
-
 _register("llama7b", _build_llama_like,
           num_layers=32, hidden_size=4096, ffn_size=11008, num_heads=32, head_dim=128,
           vocab_size=32000, max_seq_len=2048)
 
-_register("llama13b", _build_llama_like,
-          num_layers=40, hidden_size=5120, ffn_size=13824, num_heads=40, head_dim=128,
-          vocab_size=32000, max_seq_len=2048)
-
-_register("llama70b", _build_llama_like,
-          num_layers=80, hidden_size=8192, ffn_size=28672, num_heads=64, head_dim=128,
-          vocab_size=32000, max_seq_len=2048)
-
-_register("qwen7b", _build_llama_like,
-          num_layers=32, hidden_size=4096, ffn_size=11008, num_heads=32, head_dim=128,
-          vocab_size=151936, max_seq_len=2048)
-
 
 def get_model(model_name: str) -> dict:
-    """用户只需传名字: 'llama7b', 'llama13b', 'qwen7b', 'tiny'"""
+    """用户只需传名字: 'llama7b'"""
     if model_name not in QUERYABLE_MODELS:
         raise KeyError(f"Unknown model '{model_name}'. Available: {list(QUERYABLE_MODELS.keys())}")
     return QUERYABLE_MODELS[model_name]()

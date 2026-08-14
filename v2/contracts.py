@@ -28,18 +28,22 @@ class DeviceType(IntEnum):
 
 
 class PrecisionLevel(IntEnum):
-    """四种精度模式，数值=等级（越大精度越高，成本越高）
-    兼容规则: hardware.supported 中最大等级 >= operator.required 才允许计算。
-    - FP32 = 4 (最高)
-    - FP16 = 3  (BF16 同档)
-    - INT8 = 2
+    """六种计算精度，数值=精度等级（越大精度越高，成本越高）。
+    注意: 这里按"精度顺序"而非 bit width 排序，以便 IEEE 浮点(FP8/FP16/BF16/FP32)
+    与定点(INT4/INT8)在同一规模下可比。保留 HIGH/LOW 语义别名。
     - INT4 = 1 (最低)
-    HIGH/LOW 概念仍可用：HIGH 视作 >=FP16，LOW 视作 <=INT8。
+    - INT8 = 2
+    - FP8  = 3
+    - FP16 = 4
+    - BF16 = 5  (BF16 独立成档；与 FP16 同属 16-bit 但尾数精度不同)
+    - FP32 = 6 (最高)
     """
     INT4 = 1
     INT8 = 2
-    FP16 = 3
-    FP32 = 4
+    FP8 = 3
+    FP16 = 4
+    BF16 = 5
+    FP32 = 6
 
     # 语义别名（继承自设计文档的 HIGH/LOW 概念）
     @property
@@ -54,19 +58,33 @@ class PrecisionLevel(IntEnum):
     def from_name(cls, name: str) -> "PrecisionLevel":
         """从字符串构造，兼容 'FP32'/'fp32'/'HIGH'/'LOW'"""
         up = str(name).strip().upper()
-        if up == "FP32":
-            return cls.FP32
-        if up in ("FP16", "BF16"):
-            return cls.FP16
-        if up == "INT8":
-            return cls.INT8
-        if up == "INT4":
-            return cls.INT4
-        if up == "HIGH":
-            return cls.FP16
-        if up == "LOW":
-            return cls.INT8
-        raise ValueError(f"未知精度: '{name}'。可选: FP32/FP16/INT8/INT4 (或 HIGH/LOW)")
+        mapping = {
+            "FP32": cls.FP32, "FP16": cls.FP16, "BF16": cls.BF16,
+            "FP8": cls.FP8, "INT8": cls.INT8, "INT4": cls.INT4,
+            "HIGH": cls.FP16, "LOW": cls.INT8,
+        }
+        if up in mapping:
+            return mapping[up]
+        raise ValueError(
+            f"未知精度: '{name}'。可选: FP32/BF16/FP16/FP8/INT8/INT4 (或 HIGH/LOW)")
+
+
+class OperatorCategory(IntEnum):
+    """算子类别：当前固定只有两类。
+    LINEAR    线性计算（矩阵乘/投影/残差/查表等）
+    NONLINEAR 非线性计算（LayerNorm/Softmax/激活等）
+    """
+    LINEAR = 0
+    NONLINEAR = 1
+
+    @classmethod
+    def from_name(cls, name: str) -> "OperatorCategory":
+        up = str(name).strip().upper()
+        if up == "LINEAR":
+            return cls.LINEAR
+        if up == "NONLINEAR":
+            return cls.NONLINEAR
+        raise ValueError(f"未知算子类别: '{name}'。可选: LINEAR/NONLINEAR")
 
 
 class BottleneckType(IntEnum):
@@ -136,6 +154,10 @@ class Operator:
     op_type: str
     flops: int
     required_precision: PrecisionLevel = PrecisionLevel.FP16
+    # ---- 精度与算子类别系统（v2.3）----
+    category: OperatorCategory = OperatorCategory.LINEAR
+    data_precision: PrecisionLevel = PrecisionLevel.FP16
+    execution_precision: Optional[PrecisionLevel] = None
     input_ids: list = field(default_factory=list)
     output_ids: list = field(default_factory=list)
     shape_desc: str = ""

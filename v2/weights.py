@@ -20,10 +20,13 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 # ---------------------------------------------------------------- 常量
-# 权重后缀 → 所属类别
+# 权重后缀 → 所属类别（与新算子 DAG 匹配）
 WEIGHT_MEMBERSHIP = {
-    "ln1_w":   "W_ln",
-    "ln2_w":   "W_ln",
+    "qkv_weight":    "W_attn",
+    "o_proj_weight": "W_attn",
+    "gate_weight":   "W_mlp",
+    "up_weight":     "W_mlp",
+    "down_weight":   "W_mlp",
     "q_w":     "W_attn",
     "k_w":     "W_attn",
     "v_w":     "W_attn",
@@ -78,7 +81,7 @@ def detect_weight_class(weight_name: str) -> Optional[str]:
     if weight_name is None:
         return None
     name = weight_name
-    if name in ("lm_head_w",):
+    if name in ("lm_head_w", "lm_head_weight"):
         return "W_head"
     if name in ("embed_weight", "embed_w", "input_embed"):
         return "W_embed"
@@ -123,28 +126,22 @@ def build_weight_blocks(model_name: str, num_layers: int,
         blocks[weight_id] = wb
         return wb
 
-    # 全局 embeddings / lm_head（每模型一份）
-    if "W_embed" in (class_split or {}):
-        add("embed_weight", "W_embed", v, h, None,
-            consumers=["embedding"], input_slots={"embedding": 0})
-    if "W_head" in (class_split or {}):
-        add("lm_head_w", "W_head", v, h, None,
-            consumers=["lm_head"], input_slots={"lm_head": 0})
+    # 全局 embeddings / lm_head（每模型一份，始终生成；消费者为新算子名 Embedding / LMHead，第 1 路权重输入）
+    # class_split 只决定是否切分（add 内部按 weight_class 查切分数），不影响生成。
+    add("embed_weight", "W_embed", v, h, None,
+        consumers=["Embedding"], input_slots={"Embedding": 1})
+    add("lm_head_weight", "W_head", v, h, None,
+        consumers=["LMHead"], input_slots={"LMHead": 1})
 
     # 每层
     for L in range(num_layers):
         pre = f"L{L}_"
 
-        add(f"{pre}q_w", "W_attn", h, h, L, [pre + "q_proj"], {pre + "q_proj": 1})
-        add(f"{pre}k_w", "W_attn", h, h, L, [pre + "k_proj"], {pre + "k_proj": 1})
-        add(f"{pre}v_w", "W_attn", h, h, L, [pre + "v_proj"], {pre + "v_proj": 1})
-        add(f"{pre}o_w", "W_attn", h, h, L, [pre + "o_proj"], {pre + "o_proj": 1})
-        add(f"{pre}ffn_gw", "W_mlp", f, h, L, [pre + "ffn_gate"], {pre + "ffn_gate": 1})
-        add(f"{pre}ffn_uw", "W_mlp", f, h, L, [pre + "ffn_up"], {pre + "ffn_up": 1})
-        # 注意：workload 里 ffn_down 的输入是 [ffn_up, ffn_silu]，不消费独立权重矩阵，
-        # 因此这里不生成 ffn_down_w（避免悬空权重块 / W1 误报）。
-        add(f"{pre}ln1_w", "W_ln", h, 1, L, [pre + "ln1"], {pre + "ln1": 1})
-        add(f"{pre}ln2_w", "W_ln", h, 1, L, [pre + "ln2"], {pre + "ln2": 1})
+        add(f"{pre}qkv_weight", "W_attn", 3 * h, h, L, [pre + "qkv_proj"], {pre + "qkv_proj": 1})
+        add(f"{pre}o_proj_weight", "W_attn", h, h, L, [pre + "o_proj"], {pre + "o_proj": 1})
+        add(f"{pre}gate_weight", "W_mlp", f, h, L, [pre + "ffn_gate"], {pre + "ffn_gate": 1})
+        add(f"{pre}up_weight", "W_mlp", f, h, L, [pre + "ffn_up"], {pre + "ffn_up": 1})
+        add(f"{pre}down_weight", "W_mlp", h, f, L, [pre + "ffn_down"], {pre + "ffn_down": 1})
     return blocks
 
 

@@ -232,166 +232,193 @@ class WorkloadBuilder:
 
     # ---------- 构建单层模板 ----------
     def _make_layer_kernels(self, layer, seq, batch):
-        """构建第 layer 层模板，每个 kernel 定义 cost_fn(kv_len)。
-        对所有"不随 KV 变"的算子，cost_fn 恒返回定值(用 seq 算)；
-        对 attn/softmax/av/kv 等随 KV 变的算子，cost_fn 依赖 kv_len。
+        """构建第 layer 层模板，包含 16 个算子（Embedding/LMHead 是全局算子，不在层内）。
+        建立层内算子间的数据依赖：中间张量作为前一算子 output 与后一算子 input 串联。
+        对 KV 相关算子（Attn_Score/Softmax/Attn_Context/KV_Cache_Read）绑定 cost_fn(kv_len)。
         """
         pre = f"L{layer}_"
         h, f, nh, hd, B = self.h, self.f, self.nh, self.hd, self.b
         m = batch * seq          # 行数（Prefill: seq; Decode Q 侧=1，见下）
-        kv0 = seq                # 初始 KV 长度 = seq（Prefill 即全部）
         kernels = []
-        gflops = self._gemm_flops
 
-        # LN1
+        # 1) LN1: hidden_states -> ln1_out
         kernels.append(Kernel(
             id=f"{pre}ln1", name="LN1", op_type=KernelType.LAYERNORM,
-            inputs=[f"{pre}input_act", f"{pre}ln1_w"], intermediates=[],
-            outputs=[f"{pre}ln1_out"],
-            attributes={"seq": seq},
+            inputs=[f"{pre}hidden_states"], intermediates=[],
+            outputs=[f"{pre}ln1_out"], attributes={"seq": seq},
         ))
 
-        # Q/K/V projection（不随 KV 变，行数由 active seq 决定）
-        #   注: 真正的 Decode 中 Q/K/V 的 m=1；但 workload 展示各层模板时用 seq 代表该层在
-        #   "Preffill 或 Decode 单步"下的规模。为清晰，这里用固定 m（= batch*seq）。
-        for proj in ("q", "k", "v"):
-            kernels.append(Kernel(
-                id=f"{pre}{proj}_proj", name=f"{proj}_proj", op_type=KernelType.GEMM,
-                inputs=[f"{pre}ln1_out", f"{pre}{proj}_w"], intermediates=[],
-                outputs=[f"{pre}{proj}_out"], attributes={"M": m, "K": h, "N": h},
-            ))
-
-        # Attn QK^T: compute 随 kv_len 增长 (Q 行=m, K 列=kv_len)
+        # 2) QKV_proj：合并 Q/K/V 三次投影（读 qkv_weight）-> q, k, v
+        #    N=3*hidden（与方案一致，供算子切割沿 N 切出 Q/K/V）；cost 由 _bind_cost 的 qkv 分支固定 3·(2·h·h)
         kernels.append(Kernel(
-            id=f"{pre}attn_qk", name="Attn_QK", op_type=KernelType.GEMM,
-            inputs=[f"{pre}q_out", f"{pre}k_out"], intermediates=[f"{pre}score"],
-            outputs=[], attributes={"M": m, "K": h, "N": "kv_len"},
+            id=f"{pre}qkv_proj", name="QKV_proj", op_type=KernelType.GEMM,
+            inputs=[f"{pre}ln1_out", f"{pre}qkv_weight"], intermediates=[],
+            outputs=[f"{pre}q", f"{pre}k", f"{pre}v"],
+            attributes={"M": m, "K": h, "N": 3 * h, "triple": True},
         ))
 
-        # Softmax: 读 score(m×kv_len)
+        # 3) RoPE：对 q/k 施加旋转位置编码 -> q_rot, k_rot
+        #    提供 seq 供算子切割沿序列维分片（cost 由 _bind_cost 按 kind=rope 固定 6*h）
         kernels.append(Kernel(
-            id=f"{pre}softmax", name="Softmax", op_type=KernelType.SOFTMAX,
-            inputs=[f"{pre}score"], intermediates=[], outputs=[f"{pre}probs"],
+            id=f"{pre}rope", name="RoPE", op_type=KernelType.ACTIVATION,
+            inputs=[f"{pre}q", f"{pre}k"], intermediates=[],
+            outputs=[f"{pre}q_rot", f"{pre}k_rot"], attributes={"kind": "rope", "seq": seq},
+        ))
+
+        # 4) KV_Cache_Write：把当前步 K/V 追加进 kv_cache（固定增量）
+        kernels.append(Kernel(
+            id=f"{pre}kv_cache_write", name="KV_Cache_Write", op_type=KernelType.KVCACHE_UPDATE,
+            inputs=[f"{pre}k_rot", f"{pre}v"], intermediates=[], outputs=[f"{pre}kv_cache"],
             attributes={"kv_len": "kv_len"},
         ))
 
-        # Attn QK·V: compute 随 kv_len (m × kv_len × h)
+        # 5) KV_Cache_Read：从 kv_cache 读出全部历史 K/V（含当前步）-> full_k, full_v
         kernels.append(Kernel(
-            id=f"{pre}attn_av", name="Attn_AV", op_type=KernelType.GEMM,
-            inputs=[f"{pre}probs", f"{pre}v_out"], intermediates=[],
-            outputs=[f"{pre}attn_out"], attributes={"M": m, "K": "kv_len", "N": h},
+            id=f"{pre}kv_cache_read", name="KV_Cache_Read", op_type=KernelType.KVCACHE_UPDATE,
+            inputs=[f"{pre}kv_cache"], intermediates=[],
+            outputs=[f"{pre}full_k", f"{pre}full_v"], attributes={"kv_len": "kv_len"},
         ))
 
-        # O proj（不随 KV 变）
+        # 6) Attn_Score = Q·K^T（依赖 kv_len）
+        kernels.append(Kernel(
+            id=f"{pre}attn_score", name="Attn_Score", op_type=KernelType.GEMM,
+            inputs=[f"{pre}q_rot", f"{pre}full_k"], intermediates=[f"{pre}attn_scores"],
+            outputs=[], attributes={"M": m, "K": h, "N": "kv_len"},
+        ))
+
+        # 7) Softmax（依赖 kv_len）
+        kernels.append(Kernel(
+            id=f"{pre}softmax", name="Softmax", op_type=KernelType.SOFTMAX,
+            inputs=[f"{pre}attn_scores"], intermediates=[], outputs=[f"{pre}attn_probs"],
+            attributes={"kv_len": "kv_len"},
+        ))
+
+        # 8) Attn_Context = P·V（依赖 kv_len）
+        kernels.append(Kernel(
+            id=f"{pre}attn_context", name="Attn_Context", op_type=KernelType.GEMM,
+            inputs=[f"{pre}attn_probs", f"{pre}full_v"], intermediates=[],
+            outputs=[f"{pre}attn_context"], attributes={"M": m, "K": "kv_len", "N": h},
+        ))
+
+        # 9) O_proj
         kernels.append(Kernel(
             id=f"{pre}o_proj", name="O_proj", op_type=KernelType.GEMM,
-            inputs=[f"{pre}attn_out", f"{pre}o_w"], intermediates=[],
-            outputs=[f"{pre}o_out"], attributes={"M": m, "K": h, "N": h},
+            inputs=[f"{pre}attn_context", f"{pre}o_proj_weight"], intermediates=[],
+            outputs=[f"{pre}attn_output"], attributes={"M": m, "K": h, "N": h},
         ))
 
-        # Residual1 (有 mem)
+        # 10) Residual1: attn_output + hidden_states -> h1
         kernels.append(Kernel(
             id=f"{pre}resid1", name="Residual1", op_type=KernelType.RESIDUAL,
-            inputs=[f"{pre}input_act", f"{pre}o_out"], intermediates=[],
-            outputs=[f"{pre}resid1_out"], attributes={},
+            inputs=[f"{pre}attn_output", f"{pre}hidden_states"], intermediates=[],
+            outputs=[f"{pre}h1"], attributes={},
         ))
 
-        # LN2
+        # 11) LN2
         kernels.append(Kernel(
             id=f"{pre}ln2", name="LN2", op_type=KernelType.LAYERNORM,
-            inputs=[f"{pre}resid1_out", f"{pre}ln2_w"], intermediates=[],
-            outputs=[f"{pre}ln2_out"], attributes={"seq": seq},
+            inputs=[f"{pre}h1"], intermediates=[], outputs=[f"{pre}ln2_out"],
+            attributes={"seq": seq},
         ))
 
-        # FFN gate/up/down + SiLU（不随 KV 变，m 由 active seq 决定）
+        # 12-13) FFN gate / up（并行）
         kernels.append(Kernel(
             id=f"{pre}ffn_gate", name="FFN_gate", op_type=KernelType.GEMM,
-            inputs=[f"{pre}ln2_out", f"{pre}ffn_gw"], intermediates=[],
-            outputs=[f"{pre}ffn_gate"], attributes={"M": m, "K": h, "N": f},
+            inputs=[f"{pre}ln2_out", f"{pre}gate_weight"], intermediates=[],
+            outputs=[f"{pre}gate_out"], attributes={"M": m, "K": h, "N": f},
         ))
         kernels.append(Kernel(
             id=f"{pre}ffn_up", name="FFN_up", op_type=KernelType.GEMM,
-            inputs=[f"{pre}ln2_out", f"{pre}ffn_uw"], intermediates=[],
-            outputs=[f"{pre}ffn_up"], attributes={"M": m, "K": h, "N": f},
+            inputs=[f"{pre}ln2_out", f"{pre}up_weight"], intermediates=[],
+            outputs=[f"{pre}up_out"], attributes={"M": m, "K": h, "N": f},
         ))
+
+        # 14) SiLU: gate_out * silu(up_out) -> silu_out
         kernels.append(Kernel(
             id=f"{pre}ffn_silu", name="SiLU", op_type=KernelType.ACTIVATION,
-            inputs=[f"{pre}ffn_gate"], intermediates=[], outputs=[f"{pre}ffn_silu"],
-            attributes={"kind": "silu"},
+            inputs=[f"{pre}gate_out", f"{pre}up_out"], intermediates=[],
+            outputs=[f"{pre}silu_out"], attributes={"kind": "silu"},
         ))
+
+        # 15) FFN_down
         kernels.append(Kernel(
             id=f"{pre}ffn_down", name="FFN_down", op_type=KernelType.GEMM,
-            inputs=[f"{pre}ffn_up", f"{pre}ffn_silu"], intermediates=[],
-            outputs=[f"{pre}ffn_down_out"], attributes={"M": m, "K": f, "N": h},
+            inputs=[f"{pre}silu_out", f"{pre}down_weight"], intermediates=[],
+            outputs=[f"{pre}mlp_output"], attributes={"M": m, "K": f, "N": h},
         ))
 
-        # Residual2
+        # 16) Residual2: mlp_output + h1 -> layer_output（跨层连接用）
         kernels.append(Kernel(
             id=f"{pre}resid2", name="Residual2", op_type=KernelType.RESIDUAL,
-            inputs=[f"{pre}resid1_out", f"{pre}ffn_down_out"], intermediates=[],
-            outputs=[f"{pre}out"], attributes={},
+            inputs=[f"{pre}mlp_output", f"{pre}h1"], intermediates=[],
+            outputs=[f"{pre}layer_output"], attributes={},
         ))
 
-        # KVCache update: 写 K/V（随 kv_len 增）
-        kernels.append(Kernel(
-            id=f"{pre}kv_update", name="KVUpdate", op_type=KernelType.KVCACHE_UPDATE,
-            inputs=[f"{pre}k_out", f"{pre}v_out"], intermediates=[],
-            outputs=[f"{pre}kv_cache"], attributes={"kv_len": "kv_len"},
-        ))
-
-        # LMHead / Embedding 放到全局（不在层内）
+        # 层内算子到此为止；Embedding / LMHead 放全局
         return kernels
 
-    # ---------- 绑定 cost_fn 到每个 kernel ----------
+    # ---------- 绑定 cost 到每个 kernel ----------
+    # 成本遵循 LLaMA-7B decode(batch=1,seq=1) 常数表 + 4 个 KV 动态 cost_fn。
+    # 变量: h, f, V(vocab), nh, hd；字节约定: 激活 FP32=4B、KV INT4=0.5B、INT8 权重=1B。
     def _bind_cost(self, k: Kernel, layer, seq, batch):
-        """给 kernel 绑定 cost_fn(kv_len)。不随 KV 变的绑定定值函数。"""
-        h, f, B = self.h, self.f, self.b
-        m = batch * seq
-        gflops = self._gemm_flops
+        h, f, nh, hd = self.h, self.f, self.nh, self.hd
+        V = self.vocab
+        m = batch * seq                 # decode(seq=1) 时 m=1
+        H4 = h * 4
+        W8 = 1                          # INT8 权重字节
 
         if k.op_type == KernelType.LAYERNORM:
-            c = self._layernorm_compute(seq, batch)
-            mc = self._layernorm_mem(seq, batch)
-            k.cost = Cost.fixed(c, mc)
+            # LN: FLOPs=5*h；mem=(in+out) 两个 hidden ×4
+            k.cost = Cost.fixed(5 * h, 2 * H4)
             k.cost_fn = None
         elif k.op_type == KernelType.RESIDUAL:
-            k.cost = Cost.fixed(0, 2 * seq * h * B)
+            k.cost = Cost.fixed(0, 2 * H4)   # 两个输入各一个 hidden
             k.cost_fn = None
         elif k.op_type == KernelType.ACTIVATION:
-            k.cost = Cost.fixed(m * f * 3, m * f * B)
+            # RoPE: FLOPs=6*h(处理 q,k two)，mem=2*h×4；SiLU: FLOPs=3*f，mem=(f+f)×4
+            if k.attributes.get("kind") == "rope":
+                k.cost = Cost.fixed(6 * h, 2 * H4)
+            else:
+                k.cost = Cost.fixed(3 * f, 2 * f * 4)
             k.cost_fn = None
-        elif "attn_qk" in k.id:
-            # Q: m×h, K: h×kv → compute=2·m·kv·h; mem≈(m+kv)·h
-            def _qk(kv, bat=batch):
-                return (gflops(m, kv, h), (m + kv) * h * B)
-            k.cost_fn = _qk
-            k.cost = None  # 由下方统一按范围填入
+        elif "kv_cache_write" in k.id:
+            # 固定增量：当前步 K/V 追加，不随 kv_len 增长。FLOPs=0，mem = 2*h*0.5 = h
+            k.cost = Cost.fixed(0, h)
+            k.cost_fn = None
+        elif "kv_cache_read" in k.id:
+            # FLOPs=0；memory = kv_len*nh*hd*2*0.5 = kv_len*nh*hd（K/V 各半，INT4）
+            def _kvr(kv):
+                return (0, kv * nh * hd)
+            k.cost_fn = _kvr; k.cost = None
+        elif "attn_score" in k.id:
+            # FLOPs = 2*nh*hd*kv；mem = Q(nh*hd*4)+K(kv*nh*hd*0.5)+out(kv*nh*4)
+            def _qk(kv):
+                return (2 * nh * hd * kv, (nh * hd * 4) + (kv * nh * hd * 0.5) + (kv * nh * 4))
+            k.cost_fn = _qk; k.cost = None
         elif "softmax" in k.id:
-            def _sm(kv, bat=batch):
-                s = m * kv
-                return (s * 5, s * 2 * B)
-            k.cost_fn = _sm
-            k.cost = None
-        elif "attn_av" in k.id:
-            def _av(kv, bat=batch):
-                return (gflops(m, h, kv), (m * kv + kv * h) * B)
-            k.cost_fn = _av
-            k.cost = None
-        elif "kv_update" in k.id:
-            def _kv(kv, bat=batch):
-                return (0, 2 * kv * h * B)
-            k.cost_fn = _kv
-            k.cost = None
-        else:  # GEMM (q/k/v/o proj, ffn)
-            # 用 attributes 里的 M/K/N（M 由 attributes 给定，K/N 定值）
+            # FLOPs = 3*nh*kv；mem = in(kv*nh*4)+out(kv*nh*4)
+            def _sm(kv):
+                return (3 * nh * kv, 2 * (kv * nh * 4))
+            k.cost_fn = _sm; k.cost = None
+        elif "attn_context" in k.id:
+            # FLOPs = 2*nh*hd*kv；mem = probs(kv*nh*4)+V(kv*nh*hd*0.5)+out(nh*hd*4)
+            def _ac(kv):
+                return (2 * nh * hd * kv, (kv * nh * 4) + (kv * nh * hd * 0.5) + (nh * hd * 4))
+            k.cost_fn = _ac; k.cost = None
+        elif "qkv_proj" in k.id:
+            # QKV_proj: FLOPs=3*(2*h*h)；mem=(m*h 输入 + 3*h 输出)*4 + 权重(3*h*h)*1
+            k.cost = Cost.fixed(3 * 2 * h * h, (m * h + 3 * h) * 4 + 3 * h * h * W8)
+            k.cost_fn = None
+        elif "ffn_down" in k.id:
+            # FFN_down: FLOPs=2*f*h；mem=(m*f 输入 + h 输出)*4 + 权重(f*h)*1
+            k.cost = Cost.fixed(2 * f * h, (m * f + h) * 4 + f * h * W8)
+            k.cost_fn = None
+        else:  # 其余 GEMM：O_proj / FFN_gate / FFN_up，按 attributes M/K/N
             M = k.attributes.get("M", m)
             K = k.attributes.get("K", h)
             N = k.attributes.get("N", h)
-            if "ffn" in k.id:
-                K = h if "gate" in k.id or "up" in k.id else f
-                N = f if "gate" in k.id or "up" in k.id else h
-            c = gflops(M, K, N)
-            mc = (M + N) * K * B
+            c = 2 * M * K * N
+            mc = (M + N) * 4 + K * N * W8
             k.cost = Cost.fixed(c, mc)
             k.cost_fn = None
         return k
@@ -408,31 +435,41 @@ class WorkloadBuilder:
 
         layers = []
         all_kernels = []
+        # 跨层隐藏状态 id：L0 = Embedding 输出的全局 hidden_states；
+        # L>0 = 上一层 Res2 的 layer_output（同一 DataObject，形成跨层数据依赖链）。
+        prev_layer_output = "hidden_states"
 
         for L in range(num_layers):
             layer_kernels = []
             for tk in template_kernels:
                 # 复制到当前层
                 new_id = tk.id.replace("L0_", f"L{L}_")
+                inputs = [i.replace("L0_", f"L{L}_") for i in tk.inputs]
+                outputs = [o.replace("L0_", f"L{L}_") for o in tk.outputs]
+                # 跨层输入替换：LN1(input[0])、Residual1(input[1]) 消费的 hidden_states
+                # 改为真正的隐藏状态来源（L0=Embedding 输出，L>0=上一层 layer_output）。
+                hidden_id = f"{prev_layer_output}" if L == 0 else prev_layer_output
+                inputs = [hidden_id if (i == f"L{L}_hidden_states") else i for i in inputs]
                 k = Kernel(
                     id=new_id, name=tk.name, op_type=tk.op_type,
-                    inputs=[i.replace("L0_", f"L{L}_") for i in tk.inputs],
+                    inputs=inputs,
                     intermediates=[i.replace("L0_", f"L{L}_") for i in tk.intermediates],
-                    outputs=[o.replace("L0_", f"L{L}_") for o in tk.outputs],
+                    outputs=outputs,
                     attributes=dict(tk.attributes),
                 )
-                # 绑定 cost_fn
+                # 绑定 cost + 对 KV 算子求 kv_start/kv_end 范围
                 k = self._bind_cost(k, L, prefill_seq, batch)
-                # 对 KV 相关算子，用 kv_start/kv_end 求 range
                 if k.cost_fn is not None:
-                    c0, m0 = k.cost_fn(kv_start, batch)
-                    c1, m1 = k.cost_fn(kv_end, batch)
+                    c0, m0 = k.cost_fn(kv_start)
+                    c1, m1 = k.cost_fn(kv_end)
                     k.cost = Cost.range(
                         min(c0, c1), max(c0, c1),
                         min(m0, m1), max(m0, m1))
                 layer_kernels.append(k)
             layers.append(layer_kernels)
             all_kernels.extend(layer_kernels)
+            # 本层输出作为下一层输入 hidden_states
+            prev_layer_output = f"L{L}_layer_output"
 
         # LMHead / Embedding 全局算子（随 vocab，不随层）
         self._add_global_ops(all_kernels, num_layers, prefill_seq, batch, kv_start, kv_end)
@@ -461,19 +498,18 @@ class WorkloadBuilder:
         """追加全局算子: Embedding + LMHead（随 vocab，不随 KV 变）。"""
         h, V, B = self.h, self.vocab, self.b
         m = batch * seq
-        # Embedding: 查表，计算少，主要 mem 读 (input tokens × hidden)
-        emb_mem = m * h * B
+        # Embedding: FLOPs=0，mem≈输入 token 的 hidden 激活读（FP32）
         kernels.append(Kernel(
             id="embedding", name="Embedding", op_type=KernelType.EMBEDDING,
-            inputs=["input_ids"], intermediates=[], outputs=["hidden0"],
-            cost=Cost.fixed(0, emb_mem), attributes={},
+            inputs=["input_ids", "embed_weight"], intermediates=[], outputs=["hidden_states"],
+            cost=Cost.fixed(0, m * h * 4), attributes={},
         ))
-        # LMHead: 行 m, K=h, N=V；巨大 vocab
-        lm_flops = 2 * m * h * V
-        lm_mem = (m + V) * h * B
+        # LMHead: FLOPs=2*h*V；mem=(m*h 输入 + V 输出)*4 + h*V 权重
+        lm_flops = 2 * h * V
+        lm_mem = (m * h + V) * 4 + h * V * 1
         kernels.append(Kernel(
             id="lm_head", name="LMHead", op_type=KernelType.LMHEAD,
-            inputs=[f"L{num_layers-1}_out", "lm_head_w"], intermediates=[],
+            inputs=[f"L{num_layers-1}_layer_output", "lm_head_weight"], intermediates=[],
             outputs=["logits"],
             cost=Cost.fixed(lm_flops, lm_mem),
             attributes={"M": m, "K": h, "N": V},
