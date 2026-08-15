@@ -1,0 +1,83 @@
+# 04_ic_reference_hardware.yaml —— 领域专家参考硬件
+# 五类硬件 + 一个大容量纯存储 DRAM：
+#   gpu0      NVIDIA A100 80GB SXM4：通用计算 + 唯一支持 FP32 执行的加速器
+#   pim0      Samsung HBM2-PIM(Aquabolt 单 stack, 8GB)：存内 GEMM，FFN 大权重
+#   sram0     SRAM-CIM(512MB, 1.5PB/s)：逐元素/激活，FP16 执行
+#   rram0     ReRAM/NeuRRAM-CIM(256MB)：模拟存内计算（容量小，GB 级权重放不下）
+#   dram_mem0 大容量 DRAM(64GB)：纯存储，放 FFN 权重（PIM 单 stack 放不下 51GB）
+devices:
+  - id: gpu0
+    type: GPU
+    compute:
+      peak_tflops: 312
+    efficiency:
+      GEMM: 0.85
+      Attention: 0.60
+      Softmax: 0.30
+      LayerNorm: 0.25
+    memory:
+      capacity_gb: 80
+      read_bandwidth_gbs: 2039
+      write_bandwidth_gbs: 2039
+      read_latency_ns: 400
+      write_latency_ns: 400
+
+  - id: pim0
+    type: DRAM_PIM
+    compute:
+      peak_tflops: 1.2
+    efficiency:
+      GEMM: 0.70
+      Attention: 0.40
+      Softmax: 0.20
+      LayerNorm: 0.15
+    memory:
+      capacity_gb: 8
+      read_bandwidth_gbs: 307.2
+      write_bandwidth_gbs: 307.2
+      read_latency_ns: 50
+      write_latency_ns: 50
+
+  - id: sram0
+    type: SRAM_PIM
+    compute:
+      peak_tflops: 500
+    efficiency:
+      GEMM: 0.80
+      Attention: 0.50
+      Softmax: 0.30
+      LayerNorm: 0.25
+    memory:
+      capacity_mb: 512
+      read_bandwidth_gbs: 1500000
+      write_bandwidth_gbs: 1500000
+      read_latency_ns: 2
+      write_latency_ns: 2
+
+  - id: rram0
+    type: RERAM_PIM
+    compute:
+      peak_tflops: 20
+    efficiency:
+      GEMM: 0.60
+      Attention: 0.30
+      Softmax: 0.10
+      LayerNorm: 0.10
+    memory:
+      capacity_mb: 256
+      read_bandwidth_gbs: 128
+      write_bandwidth_gbs: 32
+      read_latency_ns: 10
+      write_latency_ns: 100
+
+  # 纯存储单元：大容量 DRAM 放 FFN 权重（W_mlp≈51GB），只存不整
+  - id: dram_mem0
+    type: DRAM
+    compute:
+      peak_tflops: 0
+    memory:
+      capacity_gb: 64
+      read_bandwidth_gbs: 200
+      write_bandwidth_gbs: 200
+      read_latency_ns: 60
+      write_latency_ns: 60

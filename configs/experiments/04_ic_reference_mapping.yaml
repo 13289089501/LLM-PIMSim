@@ -1,0 +1,79 @@
+# 04_ic_reference_mapping.yaml —— 领域专家算子放置
+# 决策依据（集成电路视角，按领域常识，而非"最短延时"）：
+#   GPU：通用算力 + 唯一支持 FP32 执行的加速器 + 大容量 HBM
+#        → FP32 非线性(LayerNorm/Softmax/RoPE)、注意力 GEMM（权重小、数据流内聚）、
+#          KV 缓存（HBM 大容量）、词表 Embedding/LMHead（词表权重放大到 GB 级）
+#   DRAM-PIM：存内计算、就近大权重 → FFN 三个 GEMM（权重最大，PIM 收益来源）
+#   SRAM-PIM：1.5PB/s 超高带宽 + FP16 执行 → 逐元素/激活（SiLU/Residual）
+#   ReRAM-PIM：模拟存内计算但容量小(256MB) → GB 级词表/FFN 权重放不下，本参考不承载算子
+# 注意：must 能通过"运行前校验(A3)"——算子 placed 到的设备必须在其能力表(categories/execution)内。
+default:
+  compute_device: gpu0
+  data_source: auto
+
+rules:
+  # ---- FP32 非线性（LayerNorm/Softmax/RoPE）→ GPU（唯一支持 FP32 执行的加速器）----
+  - op: "L*_ln1"
+    device: gpu0
+  - op: "L*_ln2"
+    device: gpu0
+  - op: "L*_rope"
+    device: gpu0
+  - op: "L*_softmax"
+    device: gpu0
+
+  # ---- 注意力链 GEMM（INT8，权重小、数据流内聚）→ GPU ----
+  - op: "L*_qkv_proj"
+    device: gpu0
+  - op: "L*_attn_score"
+    device: gpu0
+  - op: "L*_attn_context"
+    device: gpu0
+  - op: "L*_o_proj"
+    device: gpu0
+
+  # ---- KV 缓存（INT4 数据、无执行）→ GPU HBM（KV 随生成增长，放最大容量侧）----
+  - op: "L*_kv_cache_write"
+    device: gpu0
+  - op: "L*_kv_cache_read"
+    device: gpu0
+
+  # ---- 全局词表（Embedding/LMHead）→ GPU（词表权重 GB 级，ReRAM 放不下；LMHead FP8 精度关键）----
+  - op: "embedding"
+    device: gpu0
+  - op: "lm_head"
+    device: gpu0
+
+  # ---- FFN 三个 GEMM（INT8，权重最大）→ DRAM-PIM（存内计算，PIM 收益来源）----
+  - op: "L*_ffn_gate"
+    device: pim0
+  - op: "L*_ffn_up"
+    device: pim0
+  - op: "L*_ffn_down"
+    device: pim0
+
+  # ---- 逐元素/激活（FP16 执行）→ SRAM-PIM（超高带宽）----
+  - op: "L*_ffn_silu"
+    device: sram0
+  - op: "L*_resid1"
+    device: sram0
+  - op: "L*_resid2"
+    device: sram0
+
+  # ---- 兜底：未显式列出的算子类型 → GPU ----
+  - op_type: GEMM
+    device: gpu0
+  - op_type: LayerNorm
+    device: gpu0
+  - op_type: Softmax
+    device: gpu0
+  - op_type: Residual
+    device: gpu0
+  - op_type: Activation
+    device: gpu0
+  - op_type: Embedding
+    device: gpu0
+  - op_type: LMHead
+    device: gpu0
+  - op_type: KVCacheUpdate
+    device: gpu0

@@ -1,15 +1,42 @@
-# 仓库根 .gitignore —— 排除工具状态与旧版本目录
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
 
-# └─ Kun / Superdesign 工具运行状态（非项目内容）└─
+# ── 虚拟环境 ──
+.venv/
+venv/
+env/
+
+# ── 编辑器 / 系统 ──
+*.tmp
+*.bak
+*.orig
+*.swp
+~$*
+.DS_Store
+Thumbs.db
+*.log
+
+# ── 临时脚本（本仓库约定：_ 开头的调试/检查脚本不入库）──
+_*.py
+_*.js
+
+# > 说明：results/ 目录规划为入库（仿真结果可作为样例数据保留），
+# > 如日后不想跟踪，在此加一行：results/
+
+# 非推送目录（内部文档 / 运行结果）
+_internal/
+results/
+
+# 运行环境产物（不推送）
+.tools/
 .kun/
 .kun-canvas/
-
-# └─ 旧版本目录（v1 为早期实现；如需保留历史，删除此规则并自行 git add v1/）└─
-/v1/
-
-# └─ 内部工作文档（给 AI 的任务提示/核查文档，不对外发布）└─
-v2/修改提示词/
-v3/修改文档/
-# 预留：如日后不想跟踪某目录，在此添加一行（如 results/ ）
-
-# v2 子项目内部的忽略规则见 v2/.gitignore
+dsh-deep-whale/
+dsh-plugins/
+lancecheney-dsh-plugins/
+v3.1/

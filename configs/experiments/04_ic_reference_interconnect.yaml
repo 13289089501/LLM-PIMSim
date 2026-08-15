@@ -1,0 +1,29 @@
+# 04_ic_reference_interconnect.yaml —— 链路系统（N×N 对称带宽查找表，单位 GB/s）
+# 只定义"设备种类(type)对"之间的【链路带宽】；读写延迟/带宽由 hardware.yaml 提供。
+# 规则：
+#   - 表对称：GPU↔DRAM_PIM 写一个值即双向同带宽；对角线=同种类不同设备间互连。
+#   - 未列出的配对回退到 core.link_sys 的默认表 / 缺省带宽(100 GB/s)。
+# 数值口径（领域常识）：
+#   NVLink(GPU↔GPU) 600；PCIe 类(GPU↔PIM/DRAM) 100~200；PIM↔PIM 600；
+#   SRAM-PIM 片上互连高(1500)；ReRAM 读写不对称取上限(≈128)。
+link_bw_gbs:
+  GPU:
+    GPU: 600          # NVLink
+    DRAM_PIM: 120     # PCIe 类
+    SRAM_PIM: 200
+    RERAM_PIM: 100
+    DRAM: 150         # GPU ↔ 大容量 DRAM
+  DRAM_PIM:
+    DRAM_PIM: 600
+    SRAM_PIM: 150
+    RERAM_PIM: 100
+    DRAM: 150         # PIM ↔ 大容量 DRAM（FFN 权重流式读取）
+  SRAM_PIM:
+    SRAM_PIM: 1500
+    RERAM_PIM: 100
+    DRAM: 200
+  RERAM_PIM:
+    RERAM_PIM: 128
+    DRAM: 100
+  DRAM:
+    DRAM: 200

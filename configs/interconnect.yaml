@@ -1,0 +1,18 @@
+# interconnect.yaml — 链路系统（N×N 对称链路带宽查找表，单位 GB/s）
+#
+# 只定义"设备种类（type / link_type）对"之间的【链路带宽】；
+# 读写延迟、读写带宽由 hardware.yaml 提供（硬件系统），不在此处。
+# 跨设备搬运延时（调度器口径）：
+#   T(A→B) = A读延迟 + S/A读带宽 + S/链路带宽(A,B) + B写延迟 + S/B写带宽
+#
+# 规则：
+#   - 表按"设备种类"索引，且对称：GPU↔DRAM_PIM 写一个值即双向同带宽。
+#   - 对角线 = 同种类不同设备之间的互连带宽（如 GPU↔GPU 的 NVLink）。
+#   - 未列出的配对回退到 core.link_sys 的默认表 / 缺省带宽（100 GB/s）。
+#   - 自定义硬件：在 hardware.yaml 该设备的 `links:` 段里"加一栏"，填它与已有种类间的带宽。
+link_bw_gbs:
+  GPU:
+    DRAM_PIM: 120      # gpu0 ↔ pim0 类 PCIe（对称）
+    SRAM_PIM: 200
+  CPU:
+    GPU: 100           # cpu0 ↔ gpu0 类 PCIe

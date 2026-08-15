@@ -1,0 +1,39 @@
+# 04_ic_reference_placement.yaml —— 领域专家数据/权重初始驻留
+# 依据：权重就近其所执行设备；放不下的放最近的大容量 DRAM。
+# 模型放大到 GB 级后：
+#   - 注意力权重(W_attn: qkv/o_proj ≈17GB) 放 GPU（注意力 GEMM 在 GPU）
+#   - FFN 权重(W_mlp: gate/up/down ≈51GB) 放大容量 DRAM（PIM 单 stack 8GB 放不下 → 流式读取）
+#   - 词表权重(embed/lm_head) 放 GPU（ReRAM 256MB 放不下 GB 级词表）
+# 用 data_id 通配匹配 workload 命名；未匹配到的按 data_type 兜底。
+default_device: gpu0
+
+initial:
+  # ---- 注意力权重 → GPU ----
+  - data_id: "*qkv_weight"        # W_attn：QKV → GPU
+    devices: [gpu0]
+  - data_id: "*o_proj_weight"     # W_attn：O → GPU
+    devices: [gpu0]
+
+  # ---- FFN 权重 → 大容量 DRAM（PIM 单 stack 放不下 51GB，流式读取）----
+  - data_id: "*gate_weight"       # W_mlp：gate → 纯存储 DRAM
+    devices: [dram_mem0]
+  - data_id: "*up_weight"         # W_mlp：up → 纯存储 DRAM
+    devices: [dram_mem0]
+  - data_id: "*down_weight"       # W_mlp：down → 纯存储 DRAM
+    devices: [dram_mem0]
+
+  # ---- 词表权重 → GPU ----
+  - data_id: "embed_weight"       # 词表嵌入 → GPU
+    devices: [gpu0]
+  - data_id: "lm_head_weight"     # 词表输出 → GPU（FP8，精度关键）
+    devices: [gpu0]
+
+  # ---- 兜底：其它权重 / KV / 激活 / 中间数据 → GPU ----
+  - data_type: WEIGHT
+    devices: [gpu0]
+  - data_type: KV_CACHE
+    devices: [gpu0]
+  - data_type: ACTIVATION
+    devices: [gpu0]
+  - data_type: TEMPORARY
+    devices: [gpu0]
