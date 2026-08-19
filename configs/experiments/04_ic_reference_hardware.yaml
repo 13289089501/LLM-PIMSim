@@ -81,3 +81,15 @@ devices:
       write_bandwidth_gbs: 200
       read_latency_ns: 60
       write_latency_ns: 60
+
+  # 纯存储 SRAM（与前端 SRAM 预设 backId=sram_mem0 对应，只存不整）
+  - id: sram_mem0
+    type: SRAM
+    compute:
+      peak_tflops: 0
+    memory:
+      capacity_mb: 256
+      read_bandwidth_gbs: 1000
+      write_bandwidth_gbs: 1000
+      read_latency_ns: 2
+      write_latency_ns: 2

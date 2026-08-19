@@ -1,0 +1,16 @@
+# 05_1_hardware.yaml —— 空白模板（默认单 GPU，可自行加设备）
+devices:
+  - id: gpu0
+    type: GPU
+    compute:
+      peak_tflops: 312
+    efficiency:
+      GEMM: 0.85
+      LayerNorm: 0.25
+      Softmax: 0.30
+    memory:
+      capacity_gb: 80
+      read_bandwidth_gbs: 2039
+      write_bandwidth_gbs: 2039
+      read_latency_ns: 400
+      write_latency_ns: 400

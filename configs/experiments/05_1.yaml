@@ -1,0 +1,11 @@
+experiment:
+  name: '05_1'
+  model: llama_gb
+  seed: 42
+  files:
+    hardware: 05_1_hardware.yaml
+    interconnect: 05_1_interconnect.yaml
+    mapping: 05_1_mapping.yaml
+    placement: 05_1_placement.yaml
+  output:
+    dir: results/

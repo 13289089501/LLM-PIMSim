@@ -1,0 +1,231 @@
+================================================================
+LLM-PIMSim v3.2 — Bug 审查报告
+审查方式：全量只读代码走查 + 关键疑点运行时复现验证（不改动任何代码）
+审查范围：根目录 *.py + core/*.py + configs/*.yaml + gui_app.py
+================================================================
+
+【严重级】结果错误 / 安全风险
+----------------------------------------------------------------
+
+1. 离散事件调度时钟回退（会导致时序结果错误）
+   文件: core/engine.py:255  （Scheduler.run）
+   代码: self.clock_ns = event.end_time_ns
+   问题: 事件按 start_time 出队（堆排序），但时钟被直接赋为“该事件的结束时刻”。
+         当两个事件起点相同、终点不同（例如两条不同链路上的并行搬运同时开始，
+         或搬运与计算重叠）时，后处理的事件会让时钟“倒退”。
+   复现: 构造两条 TRANSFER（0→1000ns、0→500ns）入队后，
+         处理第一条后 clock=1000，处理第二条后 clock=500（倒退），最终总时长为 500ns。
+   影响: 后续所有调度决策（start_ns = max(clock, ...)、sync_ns、数据源就近参考、
+         日志时间戳）都基于错误的时钟；多设备并行场景下总延迟、瓶颈判定不可信。
+   建议: 时钟单调推进，如 pop 时取 event.start_time_ns（并按 start 序处理），
+         或处理完成后 clock = max(clock, event.end_time_ns)。
+
+2. workload 成本公式漏乘 m = batch×seq（prefill 计算量被低估约 2048 倍）
+   文件: core/operator_sys.py  WorkloadBuilder._bind_cost（385-424 行）与
+         _add_global_ops（489-496 行）
+   问题: 多处 FLOPs/内存公式只算了“单个 token”的量，没有乘 m（batch×seq），
+         但 workload 的输入是完整 prefill（input_tokens=2048），导致：
+         - L0_qkv_proj  flops=6h²         应为 2·m·3h·h          （实测 1.6e9 vs 3.3e12）
+         - L0_ffn_down   flops=2·f·h       应为 2·m·f·h           （实测 2.1e9 vs 4.4e12）
+         - lm_head       flops=2·h·V       应为 2·m·h·V           （实测 1.0e9 vs 2.1e12）
+         - attn_score/attn_context/softmax/kv_cache_read 的 cost_fn 全部按 m=1 计算，
+           只有 decode 阶段成立；prefill 的注意力/Softmax 计算量被低估 ~2048 倍
+         - kv_cache_write 内存 = h，写 K+V 两份应为 2·nh·hd = 2h
+   影响: “计算时间”严重失真 —— 计算瓶颈的判定、加速比对比全部不可信；
+         把 input_tokens 从 1 改到 2048，计算量几乎不变，与物理规律矛盾。
+   建议: 各公式补乘 m（或在公式内显式乘以 seq·batch）。
+
+3. WorkloadAdapter._data_sizes 把算子总内存“均摊”到所有数据对象
+   文件: core/operator_sys.py:542-551
+   代码: base = total / len(ids); return {d: base for d in ids}
+   问题: 一个 kernel 的输入+中间值+输出全部按同一份 base 记尺寸，权重与激活
+         的真实体积完全失真（实测）：
+         - embed_weight   44.7 MB  vs 真实 1048.6 MB（低 23 倍）
+         - L0_qkv_weight  187.9 MB vs 真实 805.3 MB
+         - L0_down_weight 536.9 MB vs 真实 1073.7 MB
+         - L0_kv_cache    11.9 MB  vs 真实（kv=2176 时）≈143 MB
+   影响: 跨设备搬运字节数、搬运耗时、容量校验、ALL-GATHER 权重体积全部错误；
+         权重放置收益（PIM 就近）的结论不可信。
+   建议: 权重按 形状×字节 单独计算；KV 按 2·nh·hd·kv_len·bytes 计算；
+         激活按各自形状计算，不要均摊。
+
+4. 敏感文件明文泄露：github-recovery-codes.txt
+   文件: 仓库根目录 github-recovery-codes.txt（16 行 GitHub 2FA 恢复码）
+   问题: 恢复码以明文放在仓库根目录，且 .gitignore 未排除 → 一旦提交即泄露，
+         攻击者可借此接管账号。
+   建议: 立即从仓库移除并吊销/重新生成恢复码；加入 .gitignore；检查 git 历史。
+
+5. GUI API 路径穿越（任意文件读/写）
+   文件: gui_app.py:826-836（/api/read、/api/write）
+   代码: fp = BASE / "configs" / path； (BASE/"configs"/d["path"]).write_text(...)
+   问题: path 未做任何校验/归一化，可用 "../" 跳出 configs 目录读写任意文件
+         （如 ../run.py、../bug.txt 等）。虽然默认只监听 127.0.0.1，仍是越权风险。
+   建议: 解析后校验 resolved 路径必须位于 BASE/"configs" 内，且拒绝 ".."。
+
+6. 校验器 A4（算力为 0）规则对已知硬件类型是死代码
+   文件: core/validator.py:326-353（_rule_A_compat 的 `if cap is not None:` 分支）
+         A4 判定在 366-370 行，位于该分支的 `return` 之后
+   问题: 对 7 种已知硬件类型（GPU/CPU/PIM/SRAM/DRAM…），函数在 A4 检查前就
+         return，导致“算力为 0 的硬件不能执行算子”永远不会触发。
+   复现: 给 GPU 配置 compute='0 TFLOPS' 并映射任意算子 → validate_config 返回
+         0 个错误（应报 A4）。
+   影响: 算力为 0 的硬件可顺利通过校验，仿真时该硬件上算子计算时间为 0，
+         得到“瞬时完成”的虚假结果。
+   建议: 把 A4 检查移到函数最前（或去掉提前 return）。
+
+【中等级】功能缺陷 / 结果有偏差
+----------------------------------------------------------------
+
+7. C1 容量校验对同一激活重复计数
+   文件: core/validator.py:495-549（_rule_C_capacity）
+   问题: 算子输出写入硬件（op_out→hw_w）计一次；下游算子再从该硬件读
+         （hw_r→op_in）又按下游算子的 mem_max/n_items 计一次 —— 同一个中间
+         张量沿依赖链被重复计入容量。
+   复现: 100MB 数据、60MB 容量的 GPU → 报“需要存储约 100.0 MB”（实际并发
+         驻留应为 ~50MB 量级）。
+   影响: 深层模型激活链越长，容量需求被放得越大，容易误报 C1 存储不足。
+
+8. GUI 兜底推荐 _best_device_by_eff 忽略精度约束
+   文件: gui_app.py:507-518
+   代码: let prec = h.get("precision") || ""; let sup = h.get("supported") || "";
+         两变量计算后从未使用，仅按效率取最大值
+   问题: 注释声称“挑效率最高且支持其精度的设备”，实际不检查精度 → 可能推荐
+         一个根本无法执行该算子精度的设备。
+   建议: 加上 `_can_execute` 式精度过滤后再比效率。
+
+9. input_ids 数据被归类为 OUTPUT（DataType.INPUT 从未被使用）
+   文件: core/operator_sys.py:525-533（_data_dtype_lookup）
+   代码: if "logits" in n or "input_ids" in n: return DataType.OUTPUT
+   问题: 模型输入 token 被标成输出；放置规则、C1 校验按错误类别匹配。
+   建议: input_ids → DataType.INPUT。
+
+10. 用户固定(PINNED)数据源失败时把算子标记为 FINISHED 但不执行
+    文件: core/engine.py:345-353（_schedule_op）
+    代码: self.op_states[oid] = OpState.FINISHED  # 避免死循环
+    问题: 该算子被计为“已完成”，但其输出永远不会就绪，下游算子全部卡死，
+          最终诊断显示“下游未完成”而非真正原因；完成度统计被污染。
+    建议: 改为把该算子及其原因记录进 diagnostics（如状态 NOT_RUNNABLE），
+          并让 validate_completion 正确报告。
+
+11. 默认 LayerGroup 层号偏移
+    文件: core/operator_sys.py:464
+    代码: groups = layer_groups or [LayerGroup(1, num_layers)]
+    问题: 实际算子层为 L0..L(num_layers-1)，默认分组却覆盖 1..num_layers，
+          与 to_dict 展示的层范围不一致（少 L0、多一层不存在的层）。
+
+12. compute_time_ns 在“该精度峰值=0”时静默回退到单值峰值
+    文件: core/engine.py:59-69
+    问题: 若算子执行精度的 peak_by_precision 为 0（如 ReRAM 的 FP32），
+         不会拒绝或报错，而是用硬件单值峰值（FP16/INT8 档）计算时间，
+          得到错误偏小的计算时间。应返回 0/告警，或由 can_execute 前置拦截。
+
+13. 前端预设 SRAM 的 backId='sram_mem0' 在参考实验中不存在
+    文件: gui_app.py:1250（PRESET_BACKID） vs configs/experiments/04_ic_reference_hardware.yaml
+    问题: 参考硬件集只有 dram_mem0，没有 sram_mem0；用户添加 SRAM 预设块并把
+          权重/算子放上去后，后端会报“目标设备不在硬件集”或产生无效放置。
+
+14. 模型维度在前后端三处重复硬编码，极易失配
+    文件: model_lib.py:17-20 vs gui_app.py:665、730、768-770（MODELS 字典）
+    问题: llama_gb 的维度在 4 处各自写死，改一处不同步即前后端不一致。
+
+15. 配置数据不一致（与设计意图矛盾）
+    - configs/hardware.yaml:19  cpu0 capacity_gb: 512，而
+      core/hardware_sys.py:48-49 注释称 CPU 为纯执行单元、容量≈0（4MB 缓存）；
+      结果 CPU 可存下任意数据，容量约束失效。
+    - configs/hardware.yaml rram0 capacity_mb: 64，而
+      04_ic_reference_hardware.yaml rram0 capacity_mb: 256（注释还写 256MB），
+      两套默认配置口径不一致。
+
+【轻微级】体验/健壮性问题
+----------------------------------------------------------------
+
+16. 零字节数据搬运仍计读+写延迟：local_read_time_ns(0)/local_write_time_ns(0)
+    返回延迟（core/engine.py:71-85），transfer_time_ns 对不存在/0 字节数据
+    也会调度一个“搬运事件”，徒增事件与延迟。
+
+17. parse_peak_throughput 报错文案漏掉 FP8
+    core/hardware_sys.py:236（“可选: FP32/FP16/BF16/INT8/INT4”，缺 FP8）。
+
+18. ALL-GATHER 提示直接 append 到 self.notes，未带时间戳，与其他
+    self._note() 记录格式不一致（core/engine.py:338-339）。
+
+19. experiment_runner.py:117-123 compute_map_override 的 else 分支是死代码
+    （k 不在 compute_map 时内层 `oid == k` 循环永远不会命中）。
+
+20. GUI 主体拖拽坐标混合了屏幕坐标与画布坐标，且多减了工具栏宽度
+    gui_app.py:1849-1858（left=(dx+wx-252)px）；画布滚动后拖动会跳位。
+
+21. GUI saveConfig 把每个设备的算力/容量硬编码为 peak_tflops: 300 /
+    capacity_gb: 80（gui_app.py:2548），完全丢弃画布上用户填写的参数；
+    且写出的 hardware_gui.yaml / interconnect_gui.yaml 没有被任何实验引用，
+    “保存配置”实际不起作用。
+
+22. 自定义硬件 id 由名称生成且不校验冲突：同名/重名会直接覆盖既有 block
+    （gui_app.py:1351-1358），例如自定义设备起名 “gpu0” 会顶掉预设 GPU。
+
+23. 依赖图与图例硬编码“16 个 L0 算子”（gui_app.py:2741），与模型层数
+    解耦不足。
+
+================================================================
+验证方式说明
+================================================================
+- 上述 1、2、3、6、7 均通过最小脚本运行时复现确认（数值见各条）。
+- 4、5 为静态审查确认。
+- 其余条目为静态走查得出的缺陷/不一致，未逐一构造 UI 场景复现。
+
+（本报告仅只读审查与验证，未修改任何代码文件。）
+
+================================================================
+修复记录（2025 修复后追加）
+================================================================
+下列问题已修复（修复前后均经回归验证；参考实验 04_ic_reference 修复后
+258/258 算子全部完成、completion_valid=True）：
+
+1  时钟回退            core/engine.py run()：clock = max(clock, event.end_time_ns)
+                       保持单调（复现脚本验证不再倒退）。
+2  成本公式漏 m        core/operator_sys.py _bind_cost / _add_global_ops：
+                       qkv/ffn_down/lm_head/注意力/Softmax/KV 公式补乘 m(batch×seq)，
+                       并修正 GEMM 内存公式为 M·K+M·N+K·N；
+                       实测 qkv=3.30e12、lm_head=2.15e12、attn=1.37e11 与理论一致。
+3  数据尺寸失真        core/operator_sys.py _data_sizes：
+                       权重按 K×N×字节 / 词表×隐层×字节精确计算；
+                       KV 按 2·nh·hd·kv_len×字节；注意力家族按张量形状逐 id 归属；
+                       GEMM 激活按 M/K/N 比例拆分。
+                       实测 embed=1048.6MB、qkv=805.3MB、KV=142.6MB 与真实一致。
+4  恢复码泄露          .gitignore 追加 github-recovery-codes.txt 等模式；
+                       提示：请自行删除该文件并吊销/重新生成恢复码（本地文件未代删）。
+5  路径穿越            gui_app.py 新增 _resolve_config_path 白名单校验（../ 逃逸返回 403，
+                       测试通过）。
+6  A4 死代码           core/validator.py _rule_A_compat 把 A4 检查移到最前
+                       （0 算力 GPU 现在正确报 A4，测试通过）。
+7  C1 重复计数         core/validator.py _rule_C_capacity：画布内算子产出的数据
+                       不再在“读”侧重复计费（链式用例 200MB→150MB，测试通过）；
+                       错误文案去掉误导性的 layers 变量。
+8  推荐忽略精度        gui_app.py _best_device_by_eff 增加 _hw_supports_precision 过滤，
+                       并兼容 dict/dataclass 两种算子形态（_op_field）。
+9  input_ids 归类      core/operator_sys.py _data_dtype_lookup：input_ids → INPUT
+                       （DataType.INPUT 首次被使用）。
+10 PINNED 死循环       core/common.py 新增 OpState.BLOCKED；core/engine.py PINNED 源缺失
+                       时置 BLOCKED（不再假 FINISHED、不再死循环），诊断如实上报
+                       （测试通过）。
+11 LayerGroup 偏移     core/operator_sys.py 默认分组改 LayerGroup(0, num_layers-1)。
+12 算力精度回退        core/engine.py compute_time_ns：精度峰值显式为 0 时返回 0，
+                       不再静默用单值峰值（测试通过）。
+13 SRAM 预设无后端     configs/experiments/04_ic_reference_hardware.yaml 补 sram_mem0
+                       （纯存储 SRAM，与前端 PRESET_BACKID 对应）。
+14 MODELS 重复         gui_app.py 新增 _model_dims，统一从 model_lib.MODEL_DIMS 读取
+                       （api_workload / api_split / api_weights 三处已改用）。
+15 配置不一致          configs/hardware.yaml：cpu0 容量改 capacity_mb: 4（与设计一致）、
+                       rram0 容量改 256MB（与参考实验一致）。
+16 零字节搬运          core/engine.py local_read/write_time_ns(0)=0，不再产生空搬运事件。
+17 FP8 报错文案        core/hardware_sys.py 两处错误消息补 FP8。
+18 ALL-GATHER 日志     core/engine.py 改用 self._note()（带时间戳）；[参考] 日志同改。
+19 死代码 else         experiment_runner.py 移除 compute_map_override 无效分支。
+20 拖拽坐标偏移        gui_app.py 拖拽改用 canvas getBoundingClientRect 实时换算。
+21 saveConfig 硬编码   gui_app.py 用画布真实参数序列化（compute/mem/rBW/wBW）。
+22 自定义硬件 id 冲突  gui_app.py 新增 _uniqueHwId 冲突加后缀，不再顶掉既有设备。
+23 依赖图计数          gui_app.py 图例改用 kernels.length 动态计数。
+
+验证：全部 *.py 通过 py_compile；内嵌 JS 通过 node --check；
+      /api/workload、/api/weights、/api/split、/api/read(越权403) 冒烟通过；
+      参考实验与张量并行切片（L0_ffn_down 2 片）均 258/258 完成。

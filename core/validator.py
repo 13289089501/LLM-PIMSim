@@ -15,6 +15,7 @@ LLM-PIMSim v3 core.validator — 【校验系统】
 """
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any
+import re
 
 # 精度等级统一口径：与 core.precision.PrecisionLevel 的枚举值一致。
 from core.precision import PrecisionLevel as _PL, HARDWARE_CAPABILITY
@@ -300,6 +301,13 @@ class ConstraintChecker:
                     self._rule_A_compat(o, self.hw[hw_id])
 
     def _rule_A_compat(self, o: dict, hw: dict):
+        # A4 硬件必须有计算能力 —— 放在最前面，避免被下面的精度/类别分支提前 return
+        # 吞掉（此前对 GPU/CPU/PIM 等已知类型是死代码，算力为 0 的硬件也能通过校验）。
+        if hw["peak_ops"] <= 0:
+            self._add("A4", "error",
+                      f"硬件 {hw['id']} 计算能力为 0，不能执行任何算子（包括 {o['kernelId']}）。",
+                      [o["id"], hw["id"]])
+            return
         # A3 精度/类别兼容。v3.2：与精度系统(core.precision.HARDWARE_CAPABILITY)严格对齐，
         # 不再用"等级 ≥"近似，而是按硬件类型查能力表，做"类别 + 精度列表包含"的精确判定；
         # 仅当硬件类型不在能力表(自定义类型)时才回退到等级判断。
@@ -362,11 +370,6 @@ class ConstraintChecker:
             self._add("A3", "error",
                       f"算子 {o['kernelId']} 要求 {op_prec}(等级{op_rank})，"
                       f"但硬件 {hw['id']} 最高只支持等级{_rank_name(hw_max)}——精度不兼容，无法执行。",
-                      [o["id"], hw["id"]])
-        # A4 硬件必须有计算能力
-        if hw["peak_ops"] <= 0:
-            self._add("A4", "error",
-                      f"硬件 {hw['id']} 计算能力为 0，不能执行任何算子（包括 {o['kernelId']}）。",
                       [o["id"], hw["id"]])
 
     def _hw_precision(self, hw: dict):
@@ -514,8 +517,20 @@ class ConstraintChecker:
                     continue
                 o = self.ops.get(baseB)
                 if o:
-                    item_size = o["mem_max"] / o["n_items"]
-                    charged[baseA] = charged.get(baseA, 0.0) + item_size
+                    # 若该输入数据由画布内某算子产出，其驻留已在“输出写回”时计过费，
+                    # 这里不再重复计入源硬件容量（避免同一中间张量沿依赖链被重复计数）。
+                    mm = re.match(r"^(.+)_in(\d+)$", str(to))
+                    produced = False
+                    if mm:
+                        didx = int(mm.group(2))
+                        dname = o["inputs"][didx] if didx < len(o["inputs"]) else None
+                        if dname is not None:
+                            produced = any(
+                                dname in op2["outputs"] or dname in op2["intermediates"]
+                                for op2 in self.ops.values())
+                    if not produced:
+                        item_size = o["mem_max"] / o["n_items"]
+                        charged[baseA] = charged.get(baseA, 0.0) + item_size
 
         # ── C1 权重容量：每个权重块的字节（× 全模型层数）计入其所在硬件 ──
         layers = 1
@@ -545,7 +560,7 @@ class ConstraintChecker:
                 self._add("C1", "error", f"硬件 {hw_id} 容量为 0，无法存储任何数据。", [hw_id])
             elif total > cap:
                 self._add("C1", "error",
-                          f"硬件 {hw_id} 需要存储约 {total/1e6:.1f} MB 数据（含权重×{layers}层），"
+                          f"硬件 {hw_id} 需要存储约 {total/1e6:.1f} MB 数据（含权重×全模型层数），"
                           f"但容量只有 {cap/1e6:.1f} MB——存储空间不足。", [hw_id])
 
     def _rule_B_cycle(self):

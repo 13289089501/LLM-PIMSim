@@ -22,6 +22,15 @@ from core.validator import validate_config, Issue
 app = Flask(__name__)
 BASE = Path(__file__).parent
 
+
+def _model_dims(model: str) -> dict:
+    """从 model_lib.MODEL_DIMS（单一事实来源）取模型维度，转成 GUI 侧命名
+    （hidden/ffn/heads/head_dim/vocab/layers），避免前端另写一套硬编码维度表。"""
+    from model_lib import MODEL_DIMS
+    d = dict(MODEL_DIMS.get(model, MODEL_DIMS["llama_gb"]))
+    return dict(hidden=d["hidden"], ffn=d["ffn_size"], heads=d["num_heads"],
+                head_dim=d["head_dim"], vocab=d["vocab"], layers=d["num_layers"])
+
 @app.route("/")
 def index():
     return render_template_string(HTML)
@@ -504,15 +513,36 @@ def _prec(s, PrecisionLevel):
     except ValueError:
         return PrecisionLevel.FP16
 
+def _hw_supports_precision(h, prec_name):
+    """画布硬件声明的精度（'FP32/FP16/INT8/INT4' 或 'supported'）是否包含某精度；
+    声明缺失时视为支持（不阻塞）。"""
+    s = str(h.get("precision") or h.get("supported") or "").strip()
+    if not s:
+        return True
+    pn = str(prec_name or "").strip().upper()
+    if not pn:
+        return True
+    parts = [p.strip().upper() for p in re.split(r"[/,]", s) if p.strip()]
+    return pn in parts
+
+def _op_field(op, key, default=None):
+    """兼容 dict 与对象（dataclass）两种算子形态取值。"""
+    if op is None:
+        return default
+    if isinstance(op, dict):
+        return op.get(key, default)
+    return getattr(op, key, default)
+
 def _best_device_by_eff(op, hw_in):
     """在画布硬件里，为 op 挑效率最高且支持其精度的设备。op:{op_type, precision}"""
     best, best_eff = None, -1
-    for h in hw_in:
-        # 精度支持
-        prec = h.get("precision") or ""
-        sup = h.get("supported") or ""
+    op_prec = _op_field(op, "precision")
+    op_type = _op_field(op, "op_type") or "GEMM"
+    for h in hw_in or []:
+        if not _hw_supports_precision(h, op_prec):
+            continue   # 精度不支持 → 跳过（此前只比效率、不看精度，会推给跑不了的设备）
         # efficiency 表（前端序列化的 hardware 可能不带，用默认启发式）
-        eff = _eff_guess(h, op.get("op_type") or "GEMM")
+        eff = _eff_guess(h, op_type)
         if eff > best_eff:
             best_eff = eff; best = h.get("backId") or h.get("id")
     return best
@@ -661,10 +691,8 @@ def _map_weight_devices(weight_blocks, hardware):
 @app.route("/api/workload")
 def api_workload():
     model = request.args.get("model","llama_gb")
-    MODELS = {
-        "llama_gb": dict(hidden=16384, ffn=65536, heads=128, head_dim=128, vocab=32000, layers=16, seq=2048),
-    }
-    m = MODELS.get(model, MODELS["llama_gb"])
+    m = _model_dims(model)
+    m["seq"] = 2048   # 默认序列长度
     # 用户可自定义 输入 token 数 与 自回归/生成 token 数（决定 KV 规模与序列规模）
     try:
         input_tokens = int(request.args.get("input_tokens", m["seq"]))
@@ -727,12 +755,11 @@ def api_split():
     if not dim or not isinstance(parts, list) or not len(parts):
         return jsonify({"error": "需要 dim 和 parts"}), 400
     # 从 workload 找到该 kernel
-    MODELS = {"llama_gb":[16384,65536,128,128,32000,16,2048]}
-    m = MODELS.get(model, MODELS["llama_gb"])
+    m = _model_dims(model)
     from workload_model import build_model_workload
-    wl = build_model_workload(hidden=m[0], ffn_size=m[1], num_heads=m[2],
-                              head_dim=m[3], vocab=m[4], num_layers=m[5],
-                              input_tokens=m[6], decode_steps=128)
+    wl = build_model_workload(hidden=m["hidden"], ffn_size=m["ffn"], num_heads=m["heads"],
+                              head_dim=m["head_dim"], vocab=m["vocab"], num_layers=m["layers"],
+                              input_tokens=2048, decode_steps=128)
     kernels = []
     for layer in wl.layers:
         kernels.extend(layer)
@@ -765,10 +792,7 @@ def api_weights():
     model = request.args.get("model", "llama_gb")
     split_arg = request.args.get("split", "")     # "W_mlp:2,W_attn:4"
     exp_path = (request.args.get("experiment") or "experiments/04_ic_reference.yaml").strip()
-    MODELS = {
-        "llama_gb": dict(hidden=16384, ffn=65536, heads=128, vocab=32000, layers=16),
-    }
-    m = MODELS.get(model, MODELS["llama_gb"])
+    m = _model_dims(model)
     class_split = {}
     for part in split_arg.split(","):
         part = part.strip()
@@ -777,9 +801,9 @@ def api_weights():
             if cls in ("W_attn", "W_mlp", "W_ln", "W_head", "W_embed") and n.isdigit():
                 class_split[cls] = int(n)
     # 只生成第 1 层权重块（与前端画布只显示 layers[0] 的算子对应），避免画布被 32 层撑爆
-    blocks = build_weight_blocks(model, num_layers=1, h=m["hidden"],
-                                 f=m["ffn"], nh=m["heads"], v=m["vocab"],
-                                 precision_bytes=2, class_split=class_split or None)
+    blocks_w = build_weight_blocks(model, num_layers=1, h=m["hidden"],
+                                   f=m["ffn"], nh=m["heads"], v=m["vocab"],
+                                   precision_bytes=2, class_split=class_split or None)
     # IC 参考：按权重类别推荐放置设备（与 placement.yaml 一致）：
     #   W_attn→GPU、W_mlp→纯存储DRAM(dram_mem0)、W_ln→SRAM-PIM、W_head/W_embed→GPU
     #   （词表权重放大到 GB 级，ReRAM 256MB 放不下，故词表放 GPU）
@@ -792,7 +816,7 @@ def api_weights():
     #   W_attn/W_mlp=INT8(1B)、W_head=FP8(1B)、W_embed=FP16(2B)、W_ln=FP32(4B，未建模兜底)
     CLS_BYTES = {"W_attn": 1, "W_mlp": 1, "W_ln": 4, "W_head": 1, "W_embed": 2}
     out = []
-    for wb in blocks.values():
+    for wb in blocks_w.values():
         dev = cls_dev.get(wb.weight_class) or default_dev
         pb = CLS_BYTES.get(wb.weight_class, 2)
         actual_bytes = wb.rows * wb.cols * pb
@@ -826,167 +850,216 @@ def _exp_default_device(exp_path: str) -> str:
 @app.route("/api/read")
 def api_read():
     path = request.args.get("path","")
-    fp = BASE / "configs" / path
+    fp = _resolve_config_path(path)
+    if fp is None:
+        return jsonify({"error": "路径越权，只允许读取 configs/ 下的文件。"}), 403
     return jsonify({"content": fp.read_text(encoding="utf-8")}) if fp.exists() else ("",404)
 
 @app.route("/api/write", methods=["POST"])
 def api_write():
     d = request.get_json()
-    (BASE/"configs"/d["path"]).write_text(d["content"], encoding="utf-8")
+    fp = _resolve_config_path((d or {}).get("path", ""))
+    if fp is None:
+        return jsonify({"ok": False, "error": "路径越权，只允许写入 configs/ 下的文件。"}), 403
+    fp.write_text(d.get("content", ""), encoding="utf-8")
     return jsonify({"ok":True})
+
+
+def _resolve_config_path(rel: str):
+    """把相对 configs/ 的路径解析为绝对路径；越界（.. 逃逸）返回 None。"""
+    base = (BASE / "configs").resolve()
+    try:
+        fp = (base / (rel or "")).resolve()
+    except (OSError, ValueError):
+        return None
+    if fp != base and not str(fp).startswith(str(base) + os.sep):
+        return None
+    return fp
 
 HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>LLM-PIMSim v3 — 可视化拓扑编辑器</title>
+<title>LLM-PIMSim v3.2 — Babbitt 可视化拓扑编辑器</title>
 <style>
-:root{--bg:#0f1115;--panel:#171a21;--panel2:#1d212b;--text:#c8cdd6;--text2:#7a8494;--accent:#61afef;
-  --green:#98c379;--orange:#d19a66;--purple:#c678dd;--red:#e06c75;--border:#2a2f3a;--border2:#39404d;
-  --gpu:#61afef;--dram:#98c379;--sram:#e5c07b;--reram:#c678dd;--cpu:#abb2bf;
-  --radius:8px;--shadow:0 6px 24px rgba(0,0,0,.45);}
-*{margin:0;padding:0;box-sizing:border-box}
+/* ═══════════════════════════════════════════════
+   LLM-PIMSim v3.2 — Babbitt Pixel Theme (霓虹像素风)
+   保留原霓虹配色，渲染风格改为像素：直角 / 硬阴影 / 块状按钮 / 像素字体
+   ═══════════════════════════════════════════════ */
+:root{
+  --bg:#070614;--panel:#0a0a1a;--panel2:#0f0f24;
+  --text:#c8d6ff;--text2:#6b7394;
+  --accent:#00e5ff;--accent2:#ff2d95;
+  --green:#00ff88;--orange:#ff8c42;--purple:#b44dff;--red:#ff3366;
+  --border:#1a1a3e;--border2:#2a2a5e;
+  --gpu:#00e5ff;--dram:#00ff88;--sram:#ffcc00;--reram:#b44dff;--cpu:#8899cc;
+  --radius:0px;
+  --font-pixel:'Zpix','Press Start 2P','Minecraft','VT323','Silkscreen',Consolas,'Courier New',monospace;
+}
+*{margin:0;padding:0;box-sizing:border-box;image-rendering:pixelated}
+/* ── scrollbar: 像素霓虹 ── */
 ::-webkit-scrollbar{width:10px;height:10px}
-::-webkit-scrollbar-thumb{background:#333a47;border-radius:5px}
-::-webkit-scrollbar-thumb:hover{background:#444d5e}
-::-webkit-scrollbar-track{background:transparent}
-body{font:13px/1.5 system-ui,sans-serif;background:var(--bg);color:var(--text);display:flex;height:100vh;overflow:hidden}
-/* toolbar */
-.toolbar{width:244px;background:linear-gradient(180deg,var(--panel),#13161c);border-right:1px solid var(--border);display:flex;flex-direction:column;flex-shrink:0;overflow-y:auto}
-.toolbar h2{font-size:15px;padding:16px 16px 8px;color:#fff;font-weight:700;letter-spacing:.5px}
-.toolbar .section{padding:8px 12px;border-bottom:1px solid var(--border)}
-.toolbar label{display:block;font-size:11px;color:var(--text2);margin-bottom:3px;text-transform:uppercase;letter-spacing:.5px}
-.toolbar select,.toolbar input[type=text],.toolbar input[type=number]{width:100%;padding:6px 8px;border:1px solid var(--border);border-radius:4px;background:#2c313a;color:var(--text);font-size:12px;margin-bottom:8px}
-.toolbar button{width:100%;padding:8px 12px;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;margin:3px 0;transition:all .15s}
-.btn-add{background:#20242d;color:var(--text);border:1px dashed var(--border2)}
-.btn-add:hover{background:#2a3040;border-color:var(--accent);color:var(--accent)}
-.btn-run{background:linear-gradient(135deg,var(--accent),#3f9ff0);color:#0f1115;box-shadow:0 3px 12px rgba(97,175,239,.35)}
-.btn-run:hover{background:linear-gradient(135deg,#6ec1ff,#4aa8ef);box-shadow:0 4px 16px rgba(97,175,239,.5)}
-.btn-save{background:#20242d;color:var(--green);border:1px solid #3a5040}
-.btn-save:hover{background:#2a3a2e}
-.btn-validate{background:#20242d;color:var(--orange);border:1px solid #5a4630}
-.btn-validate:hover{background:#3a3120}
-/* canvas */
-.canvas-wrap{flex:1;position:relative;overflow:auto;background:radial-gradient(circle,#2c313a 1px,transparent 1px);background-size:24px 24px}
+::-webkit-scrollbar-thumb{background:#1a1a3e;border:2px solid #00e5ff55;border-radius:0}
+::-webkit-scrollbar-thumb:hover{background:#2a2a5e;border-color:#00e5ff}
+::-webkit-scrollbar-track{background:#0a0a1a}
+body{font:13px/1.5 var(--font-pixel);background:var(--bg);color:var(--text);display:flex;height:100vh;overflow:hidden;-webkit-font-smoothing:none}
+/* ── toolbar ── */
+.toolbar{width:244px;background:linear-gradient(180deg,var(--panel),#060612);border-right:3px solid var(--border);display:flex;flex-direction:column;flex-shrink:0;overflow-y:auto}
+.toolbar h2{font-size:14px;padding:16px 16px 8px;color:var(--accent);font-weight:700;letter-spacing:1px;text-shadow:3px 3px 0 rgba(0,229,255,.25);font-family:var(--font-pixel);text-transform:uppercase}
+.toolbar .section{padding:8px 12px;border-bottom:2px solid var(--border)}
+.toolbar label{display:block;font-size:10px;color:var(--text2);margin-bottom:3px;text-transform:uppercase;letter-spacing:1px;font-family:var(--font-pixel)}
+.toolbar select,.toolbar input[type=text],.toolbar input[type=number]{width:100%;padding:6px 8px;border:2px solid var(--border);border-radius:0;background:#0d0d20;color:var(--text);font-size:12px;margin-bottom:8px;transition:border-color .15s;font-family:var(--font-pixel)}
+.toolbar select:focus,.toolbar input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 2px rgba(0,229,255,.2)}
+.toolbar button{width:100%;padding:8px 10px;border:2px solid var(--border2);border-radius:0;font-size:12px;font-weight:700;cursor:pointer;margin:3px 0;transition:transform .1s,box-shadow .1s,background .15s,color .15s;letter-spacing:.5px;box-shadow:3px 3px 0 rgba(0,0,0,.55);font-family:var(--font-pixel)}
+.toolbar button:active{transform:translate(2px,2px);box-shadow:1px 1px 0 rgba(0,0,0,.55)}
+.btn-add{background:#0d0d20;color:var(--text);border-style:dashed}
+.btn-add:hover{background:#12122e;border-color:var(--accent);border-style:solid;color:var(--accent);box-shadow:3px 3px 0 rgba(0,229,255,.25)}
+.btn-run{background:linear-gradient(180deg,#00e5ff,#0066ff);color:#070614;border-color:#00e5ff;box-shadow:3px 3px 0 rgba(0,229,255,.35);font-weight:700}
+.btn-run:hover{background:linear-gradient(180deg,#33ecff,#1a75ff);box-shadow:3px 3px 0 rgba(0,229,255,.5)}
+.btn-save{background:#0d0d20;color:var(--green);border-color:#00ff8855}
+.btn-save:hover{background:#0a1a14;border-color:#00ff88;box-shadow:3px 3px 0 rgba(0,255,136,.25)}
+.btn-validate{background:#0d0d20;color:var(--orange);border-color:#ff8c4255}
+.btn-validate:hover{background:#1a1208;border-color:#ff8c42;box-shadow:3px 3px 0 rgba(255,140,66,.25)}
+/* ── canvas: 像素网格 ── */
+.canvas-wrap{flex:1;position:relative;overflow:auto;
+  background:
+    linear-gradient(90deg,rgba(0,229,255,.07) 1px,transparent 1px),
+    linear-gradient(0deg,rgba(0,229,255,.07) 1px,transparent 1px);
+  background-size:24px 24px;background-color:#070614}
 #canvas{position:relative;width:4000px;height:3000px;min-width:100%;min-height:100%}
 #svg-lines{position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:1}
-#svg-lines line,#svg-lines path{stroke:#5c6370;stroke-width:2;fill:none}
+#svg-lines line,#svg-lines path{stroke:#3a3a6a;stroke-width:2;fill:none}
 #svg-lines line.active,#svg-lines path.active{stroke:var(--accent);stroke-width:3}
-/* blocks */
-.block{position:absolute;border-radius:var(--radius);cursor:grab;user-select:none;z-index:2;transition:box-shadow .15s,transform .15s,border-color .15s}
-.block:hover{z-index:10;border-color:var(--accent)!important}
-.block.dragging{box-shadow:0 10px 40px rgba(0,0,0,.55);z-index:100;cursor:grabbing;opacity:.92;transform:scale(1.02)}
-.block.selected{box-shadow:0 0 0 2px var(--accent),0 6px 20px rgba(0,0,0,.45)}
-.hw-block{min-width:220px;max-width:300px;border:2px solid #4a5260;color:var(--text);box-shadow:var(--shadow)}
-.hw-block .hw-header{padding:9px 12px;border-radius:var(--radius) var(--radius) 0 0;font-weight:700;font-size:12px;color:#0f1115;letter-spacing:.3px}
-.hw-block .hw-body{padding:8px 12px;background:#1d212b;border-radius:0 0 var(--radius) var(--radius);font-size:11px}
+/* ── blocks: 直角 + 硬阴影 ── */
+.block{position:absolute;border-radius:0;cursor:grab;user-select:none;z-index:2;transition:box-shadow .15s,transform .15s,border-color .15s,filter .15s;box-shadow:4px 4px 0 rgba(0,0,0,.5)}
+.block:hover{z-index:10;border-color:var(--accent)!important;filter:brightness(1.1)}
+.block.dragging{box-shadow:6px 6px 0 rgba(0,229,255,.3),8px 8px 0 rgba(0,0,0,.4);z-index:100;cursor:grabbing;opacity:.94;transform:translate(-1px,-1px) scale(1.01)}
+.block.selected{box-shadow:0 0 0 2px var(--accent),4px 4px 0 rgba(0,229,255,.3),8px 8px 0 rgba(0,0,0,.4)}
+.hw-block{min-width:220px;max-width:300px;border:3px solid #3a3a6a;color:var(--text);box-shadow:5px 5px 0 rgba(0,0,0,.5)}
+.hw-block .hw-header{padding:8px 10px;border-radius:0;font-weight:700;font-size:12px;color:#070614;letter-spacing:.5px;border-bottom:3px solid rgba(0,0,0,.25)}
+.hw-block .hw-body{padding:8px 10px;background:#0d0d20;border-radius:0;font-size:11px}
 .hw-block .hw-body .param{display:flex;justify-content:space-between;padding:2px 0;color:var(--text2)}
 .hw-block .hw-body .param .val{color:var(--text)}
-.op-block{min-width:280px;background:#1d212b;border:1px solid #39404d;padding:10px 28px;font-size:11px;border-radius:var(--radius);box-shadow:var(--shadow)}
-.op-block .op-row{display:flex;justify-content:space-between;gap:8px;padding:2.5px 0;border-bottom:1px solid #232833;align-items:baseline}
+.op-block{min-width:280px;background:#0d0d20;border:2px solid #2a2a5e;padding:10px 26px;font-size:11px;border-radius:0;box-shadow:4px 4px 0 rgba(0,0,0,.45)}
+.op-block .op-row{display:flex;justify-content:space-between;gap:8px;padding:2.5px 0;border-bottom:2px solid #1a1a38;align-items:baseline}
 .op-block .op-row:last-of-type{border-bottom:none}
 .op-block .op-row>span:first-child{color:var(--text2);flex-shrink:0}
-.op-block .op-row .val{color:#e8ecf2;text-align:right;word-break:break-all}
+.op-block .op-row .val{color:#d8e0ff;text-align:right;word-break:break-all}
 .op-block .op-row .c{color:var(--accent)}
-.op-block .op-row .p{color:#c678dd;font-weight:600}
+.op-block .op-row .p{color:#b44dff;font-weight:600}
 .op-block .op-row .m{color:var(--green)}
 .op-block .op-row .mid{color:var(--purple);font-weight:600}
 .op-block .op-row .o{color:var(--orange)}
-.op-block .op-row .rec-val{color:#98c379;font-weight:600}
+.op-block .op-row .rec-val{color:#00ff88;font-weight:600;text-shadow:1px 1px 0 rgba(0,255,136,.3)}
 .op-block .op-row b{color:var(--accent)}
 .op-block .split-btn{cursor:pointer;color:var(--accent);font-size:11px;font-weight:600}
-.op-block .split-btn:hover{color:#93c5fd;text-decoration:underline}
+.op-block .split-btn:hover{color:#00e5ff;text-shadow:1px 1px 0 rgba(0,229,255,.4);text-decoration:underline}
 .op-block .split-badge{display:inline-block}
-/* 可拖入设备的标签（算子运行设备 / 权重存储设备） */
-.op-tag,.w-tag{display:inline-block;padding:1px 9px;border-radius:11px;border:1px dashed var(--border2);color:var(--text2);font-weight:600;cursor:grab;user-select:none;background:#20242d;transition:all .12s}
-.op-tag:hover,.w-tag:hover{border-color:var(--green);color:#98c379}
-.op-tag.placed,.w-tag.placed{border-style:solid;border-color:var(--green);color:var(--green)}
-.op-tag.dragging,.w-tag.dragging{opacity:.55}
-/* weight blocks */
-.w-block{min-width:210px;background:linear-gradient(180deg,#2a2438,#221d2e);border:1px solid #6a5acd;padding:8px 12px;font-size:11px;z-index:2;border-radius:var(--radius);box-shadow:var(--shadow)}
-.w-block .w-head{display:flex;justify-content:space-between;align-items:center;gap:8px;border-bottom:1px solid #3d3552;padding-bottom:5px;margin-bottom:4px}
-.w-block .w-head b{color:#c792ea;font-size:12px}
-.w-block .w-class{display:inline-block;font-size:9px;font-weight:700;padding:1px 6px;border-radius:3px;background:#6a5acd;color:#fff;letter-spacing:.4px}
+/* ── 可拖拽标签: 方块胶囊 ── */
+.op-tag,.w-tag{display:inline-block;padding:2px 8px;border-radius:2px;border:2px dashed var(--border2);color:var(--text2);font-weight:600;cursor:grab;user-select:none;background:#0d0d20;transition:all .15s}
+.op-tag:hover,.w-tag:hover{border-color:var(--green);border-style:solid;color:#00ff88;transform:translate(-1px,-1px);box-shadow:2px 2px 0 rgba(0,255,136,.2)}
+.op-tag.placed,.w-tag.placed{border-style:solid;border-color:var(--green);color:#00ff88;background:#0a1a14;box-shadow:2px 2px 0 rgba(0,255,136,.2)}
+.op-tag.dragging,.w-tag.dragging{opacity:.5;transform:scale(1.05)}
+/* ── weight blocks ── */
+.w-block{min-width:210px;background:linear-gradient(180deg,#1a1030,#0f0a20);border:2px solid #b44dff66;padding:8px 10px;font-size:11px;z-index:2;border-radius:0;box-shadow:4px 4px 0 rgba(180,77,255,.12)}
+.w-block .w-head{display:flex;justify-content:space-between;align-items:center;gap:8px;border-bottom:2px solid #2a1a4a;padding-bottom:5px;margin-bottom:4px}
+.w-block .w-head b{color:#c792ea;font-size:12px;text-shadow:1px 1px 0 rgba(180,77,255,.3)}
+.w-block .w-class{display:inline-block;font-size:9px;font-weight:700;padding:1px 5px;border-radius:0;background:linear-gradient(180deg,#b44dff,#6a5acd);color:#fff;letter-spacing:.4px;box-shadow:2px 2px 0 rgba(0,0,0,.4)}
 .w-block .w-row{display:flex;justify-content:space-between;gap:8px;padding:2px 0;color:var(--text2)}
-.w-block .w-row .val{color:#e5e5e5;text-align:right;word-break:break-all}
+.w-block .w-row .val{color:#d8d0f0;text-align:right;word-break:break-all}
 .w-block .w-row .v{color:#c792ea;font-weight:600}
 .w-block .w-dev{color:var(--green);font-weight:600}
-.w-block .w-shard{border-top:1px dashed #4a3f66;margin-top:4px;padding-top:4px;font-size:10px;color:#b8a6e0}
+.w-block .w-shard{border-top:2px dashed #3a2060;margin-top:4px;padding-top:4px;font-size:10px;color:#b8a6e0}
 .w-block .w-shard .sp{color:var(--text2)}
-.w-block .w-tools{display:flex;gap:8px;margin-top:5px;border-top:1px dashed #3d3552;padding-top:4px}
+.w-block .w-tools{display:flex;gap:8px;margin-top:5px;border-top:2px dashed #2a1a4a;padding-top:4px}
 .w-block .w-tools span{cursor:pointer;font-size:10px;font-weight:600}
 .w-block .w-tools .sp-btn{color:#c792ea}
-.w-block .w-tools .sp-btn:hover{text-decoration:underline}
+.w-block .w-tools .sp-btn:hover{color:#b44dff;text-shadow:1px 1px 0 rgba(180,77,255,.5);text-decoration:underline}
 .w-block .w-tools .del-btn{color:var(--red);margin-left:auto}
-.w-block .w-tools .del-btn:hover{color:#f87171}
-/* ports */
-.port{position:absolute;width:14px;height:14px;border-radius:50%;border:2px solid #555;background:#2c313a;z-index:3;cursor:crosshair}
-.port:hover{transform:scale(1.3);z-index:20}
-.port .plabel{position:absolute;top:-16px;left:50%;transform:translateX(-50%);font-size:9px;color:var(--text2);white-space:nowrap;pointer-events:none;background:rgba(26,29,35,.8);padding:0 4px;border-radius:3px}
+.w-block .w-tools .del-btn:hover{color:#ff6688;text-shadow:1px 1px 0 rgba(255,51,102,.5)}
+/* ── ports: 像素方块 ── */
+.port{position:absolute;width:12px;height:12px;border-radius:1px;border:2px solid #555;background:#1a1a2e;z-index:3;cursor:crosshair;transition:all .12s}
+.port:hover{transform:scale(1.35);z-index:20;box-shadow:0 0 0 2px rgba(0,229,255,.4)}
+.port .plabel{position:absolute;top:-15px;left:50%;transform:translateX(-50%);font-size:9px;color:var(--text2);white-space:nowrap;pointer-events:none;background:rgba(10,10,26,.95);padding:0 4px;border:2px solid #1a1a3e}
 .port.read{right:-6px;top:50%;transform:translateY(-50%);border-color:var(--accent)}
 .port.write{left:-6px;top:50%;transform:translateY(-50%);border-color:var(--green)}
-.port.input{left:-6px;top:50%;transform:translateY(-50%);border-color:#999}
+.port.input{left:-6px;top:50%;transform:translateY(-50%);border-color:#8899cc}
 .port.output{right:-6px;top:50%;transform:translateY(-50%);border-color:var(--orange)}
 .port.mid{left:50%;top:-12px;transform:translateX(-50%);border-color:var(--purple)}
 .port.connected{background:var(--accent)}
-/* status */
-.status{position:fixed;bottom:12px;left:252px;font-size:11px;color:var(--text2);z-index:200;background:var(--panel);padding:6px 12px;border-radius:4px}
-.result-overlay{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:var(--panel);border:1px solid var(--border);border-radius:8px;z-index:300;display:none;min-width:380px;box-shadow:0 16px 64px rgba(0,0,0,.6)}
-.result-overlay.show{display:block}
-.result-overlay .ro-head{display:flex;align-items:center;justify-content:space-between;padding:12px 18px;border-bottom:1px solid var(--border);cursor:move;user-select:none}
-.result-overlay .ro-head .ro-title{font-size:13px;font-weight:600;color:#fff}
-.result-overlay .ro-close{margin:0;padding:2px 8px;background:none;border:none;color:var(--text2);font-size:18px;line-height:1;cursor:pointer;border-radius:4px}
-.result-overlay .ro-close:hover{color:#fff;background:#3a4050}
-.result-overlay .ro-body{padding:16px 18px;max-height:70vh;overflow:auto}
+/* ── status ── */
+.status{position:fixed;bottom:12px;left:252px;font-size:11px;color:var(--text2);z-index:200;background:#0a0a1a;padding:6px 12px;border:2px solid var(--border);box-shadow:3px 3px 0 rgba(0,0,0,.5);font-family:var(--font-pixel)}
+/* ── result overlay ── */
+.result-overlay{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:#0a0a1a;border:3px solid var(--border);border-radius:0;z-index:300;display:none;min-width:380px;box-shadow:8px 8px 0 rgba(0,229,255,.08),12px 12px 0 rgba(0,0,0,.6)}
+.result-overlay.show{display:block;animation:fadeIn .2s steps(4)}
+.result-overlay .ro-head{display:flex;align-items:center;justify-content:space-between;padding:10px 16px;border-bottom:2px solid var(--border);cursor:move;user-select:none;background:linear-gradient(180deg,#0d0d20,#0a0a1a)}
+.result-overlay .ro-head .ro-title{font-size:13px;font-weight:600;color:#00e5ff;text-shadow:2px 2px 0 rgba(0,229,255,.25);font-family:var(--font-pixel);letter-spacing:1px}
+.result-overlay .ro-close{margin:0;padding:0 6px;background:none;border:2px solid transparent;color:var(--text2);font-size:18px;line-height:1;cursor:pointer;border-radius:0;transition:all .15s}
+.result-overlay .ro-close:hover{color:#ff3366;background:#ff336622;border-color:#ff3366;box-shadow:2px 2px 0 rgba(255,51,102,.3)}
+.result-overlay .ro-body{padding:14px 16px;max-height:70vh;overflow:auto}
 .result-overlay h3{color:#fff;margin:0 0 12px}
 .result-overlay .metric{display:flex;justify-content:space-between;padding:4px 0;font-size:13px}
-.result-overlay .metric .v{font-weight:600;color:var(--accent)}
-.result-overlay .diag{border:1px solid var(--border);border-radius:6px;padding:8px 10px;background:#2c313a}
-.result-overlay .diag.warn{border-color:#5a4630}
-.result-overlay .diag.ok{border-color:#3a5040}
-.result-overlay button{margin-top:12px;padding:8px 16px;background:var(--accent);color:#1a1d23;border:none;border-radius:4px;cursor:pointer;font-weight:600}
-/* modal */
-.modal-overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.6);z-index:500;justify-content:center;align-items:center}
-.modal-overlay.show{display:flex}
-.modal{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:22px 26px;width:400px;max-height:88vh;overflow:auto;box-shadow:0 16px 48px rgba(0,0,0,.5)}
+.result-overlay .metric .v{font-weight:600;color:var(--accent);text-shadow:1px 1px 0 rgba(0,229,255,.2)}
+.result-overlay .diag{border:2px solid var(--border);border-radius:0;padding:8px 10px;background:#0d0d20}
+.result-overlay .diag.warn{border-color:#ff8c4255}
+.result-overlay .diag.ok{border-color:#00ff8855}
+.result-overlay button{margin-top:12px;padding:8px 14px;background:linear-gradient(180deg,#00e5ff,#0066ff);color:#070614;border:2px solid #00e5ff;border-radius:0;cursor:pointer;font-weight:600;box-shadow:3px 3px 0 rgba(0,229,255,.3);font-family:var(--font-pixel)}
+.result-overlay button:active{transform:translate(2px,2px);box-shadow:1px 1px 0 rgba(0,229,255,.3)}
+/* ── modal ── */
+.modal-overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.75);z-index:500;justify-content:center;align-items:center;backdrop-filter:blur(2px)}
+.modal-overlay.show{display:flex;animation:fadeIn .18s steps(3)}
+.modal{background:#0a0a1a;border:3px solid var(--border);border-radius:0;padding:20px 24px;width:400px;max-height:88vh;overflow:auto;box-shadow:8px 8px 0 rgba(0,229,255,.06),12px 12px 0 rgba(0,0,0,.6)}
 .drag-modal{position:relative;user-select:none}
-.modal-head{display:flex;align-items:center;justify-content:space-between;margin:-8px 0 12px;cursor:move;user-select:none}
-.modal-head>span{font-size:15px;font-weight:700;color:#fff}
-.modal-x{margin:0;padding:0 6px;border:none;background:none;font-size:22px;line-height:1;color:var(--text2);cursor:pointer;border-radius:4px}
-.modal-x:hover{color:#fff;background:#3a4050}
-.modal h3{color:#fff;margin-bottom:16px;font-size:15px}
-.modal label{display:block;font-size:11px;color:var(--text2);margin:8px 0 3px;text-transform:uppercase;letter-spacing:.4px}
-.modal input,.modal select{width:100%;padding:7px 10px;border:1px solid var(--border);border-radius:5px;background:#2c313a;color:var(--text);font-size:12px;margin-bottom:4px}
-.modal .btn-row{display:flex;gap:8px;margin-top:16px;justify-content:flex-end}
-.modal .btn-row button{padding:8px 18px;border-radius:5px;font-size:12px;font-weight:600;cursor:pointer}
-/* grouped operator */
-.op-in-hw{margin:4px 6px;border:1px solid #444;border-radius:4px;padding:4px 8px;background:#2c313a;font-size:10px;display:flex;align-items:center;gap:6px;position:relative}
+.modal-head{display:flex;align-items:center;justify-content:space-between;margin:-8px 0 12px;cursor:move;user-select:none;border-bottom:2px solid var(--border);padding-bottom:8px}
+.modal-head>span{font-size:14px;font-weight:700;color:#00e5ff;text-shadow:2px 2px 0 rgba(0,229,255,.25);font-family:var(--font-pixel)}
+.modal-x{margin:0;padding:0 5px;border:2px solid transparent;background:none;font-size:20px;line-height:1;color:var(--text2);cursor:pointer;border-radius:0;transition:all .15s}
+.modal-x:hover{color:#ff3366;background:#ff336622;border-color:#ff3366;box-shadow:2px 2px 0 rgba(255,51,102,.3)}
+.modal h3{color:#fff;margin-bottom:14px;font-size:14px;font-family:var(--font-pixel)}
+.modal label{display:block;font-size:10px;color:var(--text2);margin:8px 0 3px;text-transform:uppercase;letter-spacing:.8px;font-family:var(--font-pixel)}
+.modal input,.modal select{width:100%;padding:6px 9px;border:2px solid var(--border);border-radius:0;background:#0d0d20;color:var(--text);font-size:12px;margin-bottom:4px;transition:border-color .15s;font-family:var(--font-pixel)}
+.modal input:focus,.modal select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 2px rgba(0,229,255,.15)}
+.modal .btn-row{display:flex;gap:8px;margin-top:14px;justify-content:flex-end}
+.modal .btn-row button{padding:8px 16px;border:2px solid var(--border2);border-radius:0;font-size:12px;font-weight:600;cursor:pointer;background:#0d0d20;color:var(--text);box-shadow:3px 3px 0 rgba(0,0,0,.5);font-family:var(--font-pixel)}
+.modal .btn-row button:active{transform:translate(2px,2px);box-shadow:1px 1px 0 rgba(0,0,0,.5)}
+/* ── grouped operator ── */
+.op-in-hw{margin:4px 6px;border:2px solid #3a3a6a;border-radius:0;padding:4px 8px;background:#0d0d20;font-size:10px;display:flex;align-items:center;gap:6px;position:relative;transition:all .12s}
+.op-in-hw:hover{border-color:#00e5ff66;background:#0f0f28}
 .op-in-hw .detach-btn{cursor:pointer;color:var(--red);font-weight:700;font-size:13px;line-height:1;margin-left:auto}
-.op-in-hw .detach-btn:hover{color:#f87171}
-/* connections list */
-.conn-item{display:flex;align-items:center;gap:8px;padding:4px 0;font-size:11px;border-bottom:1px solid var(--border)}
+.op-in-hw .detach-btn:hover{color:#ff6688;text-shadow:1px 1px 0 rgba(255,51,102,.4)}
+/* ── connections list ── */
+.conn-item{display:flex;align-items:center;gap:8px;padding:4px 0;font-size:11px;border-bottom:2px solid var(--border)}
 .conn-item span{flex:1;color:var(--text2)}
 .conn-item .del{color:var(--red);cursor:pointer;font-weight:700}
-/* dependency drawer */
-.dep-btn{position:fixed;left:244px;top:12px;z-index:400;background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:7px 14px;font-size:12px;font-weight:600;cursor:pointer;color:var(--text);box-shadow:0 2px 8px rgba(0,0,0,.3);display:flex;align-items:center;gap:6px}
-.dep-btn:hover{border-color:var(--accent);color:var(--accent)}
-.dep-drawer{position:fixed;right:0;top:0;bottom:0;width:340px;background:var(--panel);border-left:1px solid var(--border);z-index:450;transform:translateX(100%);transition:transform .2s;display:flex;flex-direction:column;box-shadow:-8px 0 24px rgba(0,0,0,.4)}
+.conn-item .del:hover{color:#ff6688;text-shadow:1px 1px 0 rgba(255,51,102,.4)}
+/* ── dependency drawer ── */
+.dep-btn{position:fixed;left:244px;top:12px;z-index:400;background:var(--panel);border:2px solid var(--border);border-radius:0;padding:6px 12px;font-size:12px;font-weight:600;cursor:pointer;color:var(--text);box-shadow:3px 3px 0 rgba(0,0,0,.4);display:flex;align-items:center;gap:6px;font-family:var(--font-pixel)}
+.dep-btn:hover{border-color:var(--accent);color:var(--accent);box-shadow:3px 3px 0 rgba(0,229,255,.2)}
+.dep-drawer{position:fixed;right:0;top:0;bottom:0;width:340px;background:#0a0a1a;border-left:3px solid var(--border);z-index:450;transform:translateX(100%);transition:transform .25s;display:flex;flex-direction:column;box-shadow:-8px 0 24px rgba(0,0,0,.5)}
 .dep-drawer.show{transform:translateX(0)}
-.dep-header{display:flex;justify-content:space-between;align-items:center;padding:14px 16px;border-bottom:1px solid var(--border);font-weight:700;color:#fff;font-size:14px}
+.dep-header{display:flex;justify-content:space-between;align-items:center;padding:12px 14px;border-bottom:2px solid var(--border);font-weight:700;color:#00e5ff;font-size:13px;font-family:var(--font-pixel);letter-spacing:.5px;text-shadow:2px 2px 0 rgba(0,229,255,.2)}
 .dep-header .close{cursor:pointer;color:var(--red);font-size:18px;line-height:1}
-.dep-body{flex:1;overflow-y:auto;padding:14px 16px}
-.dep-layer{font-size:12px;color:var(--text2);margin:6px 0 8px;font-weight:600;text-transform:uppercase;letter-spacing:.5px}
-.dep-op{border:1px solid #3a4050;border-radius:5px;padding:7px 9px;margin-bottom:6px;background:#2c313a}
-.dep-op .dep-opname{font-weight:600;color:#e5e5e5;font-size:11px}
+.dep-header .close:hover{color:#ff6688;text-shadow:1px 1px 0 rgba(255,51,102,.4)}
+.dep-body{flex:1;overflow-y:auto;padding:12px 14px}
+.dep-layer{font-size:12px;color:var(--text2);margin:6px 0 8px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;font-family:var(--font-pixel)}
+.dep-op{border:2px solid #2a2a5e;border-radius:0;padding:7px 9px;margin-bottom:6px;background:#0d0d20}
+.dep-op:hover{border-color:#00e5ff40;background:#0f0f28}
+.dep-op .dep-opname{font-weight:600;color:#d8e0ff;font-size:11px}
 .dep-op .dep-data{font-size:10px;color:var(--text2);margin-top:2px;line-height:1.5}
-.dep-op .dep-data .tag{display:inline-block;padding:0 5px;border-radius:3px;margin-right:4px;font-size:9px}
-.dep-op .in{background:#334;color:#9aa}
-.dep-op .mid{background:#4a3355;color:#d9b8e6}
-.dep-op .out{background:#554033;color:#e6c9a8}
+.dep-op .dep-data .tag{display:inline-block;padding:0 5px;border-radius:0;margin-right:4px;font-size:9px;border:1px solid currentColor}
+.dep-op .in{background:#1a2040;color:#8899cc}
+.dep-op .mid{background:#2a1840;color:#d9b8e6}
+.dep-op .out{background:#2a1a10;color:#e6c9a8}
+/* ── animations: 分步跳变(像素感) ── */
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+@keyframes scanline{0%{background-position:0 0}100%{background-position:0 100px}}
+/* ── 扫描线 ── */
+.canvas-wrap::after{content:'';position:absolute;top:0;left:0;right:0;bottom:0;pointer-events:none;z-index:9999;
+  background:repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(0,0,0,.05) 3px,rgba(0,0,0,.05) 4px);
+  animation:scanline 6s linear infinite}
 </style></head>
 <body>
 
 <div class="toolbar" id="toolbar">
-  <h2>LLM-PIMSim</h2>
+  <h2>LLM-PIMSim v3.2</h2>
 
   <div class="section">
     <label>模型</label>
@@ -1013,7 +1086,7 @@ body{font:13px/1.5 system-ui,sans-serif;background:var(--bg);color:var(--text);d
 
   <div class="section">
     <label>依赖关系图</label>
-    <button class="btn-add" onclick="toggleDepDrawer()">&#128196; 查看算子依赖关系</button>
+    <button class="btn-add" onclick="toggleDepDrawer()">&#128196; 算子依赖关系</button>
   </div>
 
   <div class="section">
@@ -1023,8 +1096,8 @@ body{font:13px/1.5 system-ui,sans-serif;background:var(--bg);color:var(--text);d
     <button class="btn-add" onclick="addPresetHW('SRAM_PIM')">SRAM-PIM（预设）</button>
     <button class="btn-add" onclick="addPresetHW('RERAM_PIM')">ReRAM-PIM（预设）</button>
     <button class="btn-add" onclick="addPresetHW('CPU')">CPU（预设）</button>
-    <button class="btn-add" onclick="addPresetHW('SRAM')" style="border-color:var(--border2);color:#56b6c2">SRAM（纯存储）</button>
-    <button class="btn-add" onclick="addPresetHW('DRAM')" style="border-color:var(--border2);color:#d19a66">DRAM（纯存储）</button>
+    <button class="btn-add" onclick="addPresetHW('SRAM')" style="border-color:var(--border2);color:#00e5ff">SRAM（纯存储）</button>
+    <button class="btn-add" onclick="addPresetHW('DRAM')" style="border-color:var(--border2);color:#ff8c42">DRAM（纯存储）</button>
     <button class="btn-add" onclick="showCustomHWModal()" style="border-color:var(--accent);color:var(--accent)">+ 自定义硬件</button>
   </div>
 
@@ -1070,7 +1143,7 @@ body{font:13px/1.5 system-ui,sans-serif;background:var(--bg);color:var(--text);d
         <button class="modal-x" onclick="closeCompare()" title="关闭">&times;</button>
       </div>
       <label style="display:block;font-size:11px;color:var(--text2);margin-bottom:4px">选择要对比的结果（可多选，随后等后端对比）</label>
-      <div id="cmp-list" style="max-height:150px;overflow:auto;border:1px solid var(--border);border-radius:5px;padding:6px"></div>
+      <div id="cmp-list" style="max-height:150px;overflow:auto;border:1px solid var(--border);border-radius:0px;padding:6px"></div>
       <div id="cmp-msg" style="font-size:11px;color:var(--text2);margin-top:8px;min-height:14px"></div>
       <div style="display:flex;gap:8px;margin-top:12px;justify-content:flex-end">
         <button class="btn-validate" onclick="closeCompare()">取消</button>
@@ -1092,10 +1165,10 @@ body{font:13px/1.5 system-ui,sans-serif;background:var(--bg);color:var(--text);d
       <select id="new-exp-model" style="width:100%;padding:6px;box-sizing:border-box"></select>
       <label style="display:block;font-size:11px;color:var(--text2);margin:12px 0 4px">起始方式</label>
       <div style="display:flex;gap:6px;margin-bottom:8px">
-        <label style="flex:1;display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;padding:6px 8px;border:1px solid var(--border);border-radius:5px;background:#2c313a">
+        <label style="flex:1;display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;padding:6px 8px;border:1px solid var(--border);border-radius:0px;background:#0d0d20">
           <input type="radio" name="new-start" value="blank" checked onchange="onStartMode()"> 从头开始（空模板）
         </label>
-        <label style="flex:1;display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;padding:6px 8px;border:1px solid var(--border);border-radius:5px;background:#2c313a">
+        <label style="flex:1;display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;padding:6px 8px;border:1px solid var(--border);border-radius:0px;background:#0d0d20">
           <input type="radio" name="new-start" value="ref" onchange="onStartMode()"> 从参考实验开始
         </label>
       </div>
@@ -1111,11 +1184,11 @@ body{font:13px/1.5 system-ui,sans-serif;background:var(--bg);color:var(--text);d
     </div>
   </div>
 
-  <div class="section" style="font-size:10px;color:var(--text2);line-height:1.6">
-    <b>操作提示：</b><br>
-    拖拽算子/权重的「标签」到硬件方块 = 放置（运行/存储）<br>
-    从读端口拖线到算子输入 = 数据源<br>
-    从算子输出拖线到写端口 = 输出目标
+  <div class="section" style="font-size:10px;color:var(--text2);line-height:1.6;border-top:1px solid #00e5ff20">
+    <b style="color:var(--accent);font-family:var(--font-mono);letter-spacing:.5px">操作终端</b><br>
+    <span style="color:#6b7394">拖标签</span> → 硬件方块 = 放置（运行/存储）<br>
+    <span style="color:#6b7394">拖端口</span> → 端口 = 数据流连线<br>
+    <span style="color:#6b7394">Ctrl+滚轮</span> = 缩放画布
   </div>
 </div>
 
@@ -1125,14 +1198,14 @@ body{font:13px/1.5 system-ui,sans-serif;background:var(--bg);color:var(--text);d
   </div>
 </div>
 
-<div class="status" id="status">就绪。拖拽硬件方块和算子来配置。</div>
+<div class="status" id="status">◈ 就绪。拖拽硬件方块和算子来配置拓扑。</div>
 
 <button id="conn-del" title="删除选中连线" onclick="delConn(selectedConn)"
   style="display:none;position:fixed;z-index:420;background:var(--red);color:#fff;border:none;border-radius:50%;width:22px;height:22px;line-height:20px;text-align:center;cursor:pointer;font-size:15px;font-weight:700;box-shadow:0 2px 8px rgba(0,0,0,.5)">×</button>
 
 <div class="result-overlay" id="result-overlay">
   <div class="ro-head" id="ro-head">
-    <span class="ro-title">LLM-PIMSim</span>
+    <span class="ro-title">LLM-PIMSim v3.2</span>
     <button class="ro-close" title="关闭" onclick="closeResult()">&times;</button>
   </div>
   <div class="ro-body" id="ro-body"></div>
@@ -1182,7 +1255,7 @@ body{font:13px/1.5 system-ui,sans-serif;background:var(--bg);color:var(--text);d
     <h3>自定义硬件（2/2）· 链路带宽</h3>
     <div id="c-link-title" style="font-size:12px;color:var(--text2);margin-bottom:10px"></div>
     <label>到已有设备种类的链路带宽（GB/s）</label>
-    <div id="c-links" style="max-height:260px;overflow:auto;border:1px solid var(--border);border-radius:5px;padding:6px;background:#1d212b"></div>
+    <div id="c-links" style="max-height:260px;overflow:auto;border:1px solid var(--border);border-radius:0px;padding:6px;background:#0d0d20"></div>
     <div class="btn-row">
       <button onclick="cancelCustomHWAll()" style="background:#444;color:#ccc">取消</button>
       <button onclick="backCustomHW()" style="background:#444;color:#ccc">上一步</button>
@@ -1206,13 +1279,13 @@ let LINK_FALLBACK=100;
 // v3.1：模型放大到 GB 级（单层 FFN 权重≈1GB）→ 设备容量保持小值，让内存/搬运成为约束。
 //       CPU 为纯执行单元（容量≈0 + 4MB 缓存）；新增纯存储单元 SRAM / DRAM。
 const HW_TYPES={
-  GPU:{color:'#61afef',label:'GPU',compute:'312 TFLOPS',mem:'80 GB',rBW:'2039 GB/s',wBW:'2039 GB/s'},
-  DRAM_PIM:{color:'#98c379',label:'DRAM-PIM',compute:'1.2 TFLOPS',mem:'8 GB',rBW:'307.2 GB/s',wBW:'307.2 GB/s'},
-  SRAM_PIM:{color:'#e5c07b',label:'SRAM-PIM',compute:'500 TFLOPS',mem:'512 MB',rBW:'1500000 GB/s',wBW:'1500000 GB/s'},
-  RERAM_PIM:{color:'#c678dd',label:'ReRAM-PIM',compute:'20 TFLOPS',mem:'256 MB',rBW:'128 GB/s',wBW:'32 GB/s'},
-  CPU:{color:'#abb2bf',label:'CPU',compute:'45.9 TFLOPS',mem:'4 MB',rBW:'307.2 GB/s',wBW:'307.2 GB/s'},
-  SRAM:{color:'#56b6c2',label:'SRAM（纯存储）',compute:'0 TFLOPS',mem:'256 MB',rBW:'1000 GB/s',wBW:'1000 GB/s'},
-  DRAM:{color:'#d19a66',label:'DRAM（纯存储）',compute:'0 TFLOPS',mem:'64 GB',rBW:'200 GB/s',wBW:'200 GB/s'}
+  GPU:{color:'#00e5ff',label:'GPU',compute:'312 TFLOPS',mem:'80 GB',rBW:'2039 GB/s',wBW:'2039 GB/s'},
+  DRAM_PIM:{color:'#00ff88',label:'DRAM-PIM',compute:'1.2 TFLOPS',mem:'8 GB',rBW:'307.2 GB/s',wBW:'307.2 GB/s'},
+  SRAM_PIM:{color:'#ffcc00',label:'SRAM-PIM',compute:'500 TFLOPS',mem:'512 MB',rBW:'1500000 GB/s',wBW:'1500000 GB/s'},
+  RERAM_PIM:{color:'#b44dff',label:'ReRAM-PIM',compute:'20 TFLOPS',mem:'256 MB',rBW:'128 GB/s',wBW:'32 GB/s'},
+  CPU:{color:'#8899cc',label:'CPU',compute:'45.9 TFLOPS',mem:'4 MB',rBW:'307.2 GB/s',wBW:'307.2 GB/s'},
+  SRAM:{color:'#00e5ff',label:'SRAM（纯存储）',compute:'0 TFLOPS',mem:'256 MB',rBW:'1000 GB/s',wBW:'1000 GB/s'},
+  DRAM:{color:'#ff8c42',label:'DRAM（纯存储）',compute:'0 TFLOPS',mem:'64 GB',rBW:'200 GB/s',wBW:'200 GB/s'}
 };
 // 前端硬件类型 → 后端 experiment.yaml 里的真实设备 id（04_ic_reference 用 gpu0/pim0/sram0/rram0）
 const PRESET_BACKID={GPU:'gpu0',DRAM_PIM:'pim0',SRAM_PIM:'sram0',RERAM_PIM:'reram0',CPU:'cpu0',SRAM:'sram_mem0',DRAM:'dram_mem0'};
@@ -1225,16 +1298,16 @@ function _capSummary(type){
   // 纯存储单元：不执行任何算子，只展示可存精度
   if(!(cap.categories||[]).length){
     let data=(cap.data||[]).join('/');
-    return `<div class="param"><span>类型</span><span class="val" style="color:#56b6c2">纯存储（不执行算子）</span></div>
-      <div class="param"><span>可存精度</span><span class="val" style="color:#c678dd;font-size:10px">${data}</span></div>`;
+    return `<div class="param"><span>类型</span><span class="val" style="color:#00e5ff">纯存储（不执行算子）</span></div>
+      <div class="param"><span>可存精度</span><span class="val" style="color:#b44dff;font-size:10px">${data}</span></div>`;
   }
   let cats=(cap.categories||[]).map(c=>c==='NONLINEAR'?'非线性':'线性').join('+');
-  let catColor=(cap.categories||[]).length>1?'#98c379':'#61afef';
+  let catColor=(cap.categories||[]).length>1?'#00ff88':'#00e5ff';
   let data=(cap.data||[]).join('/');
   let exec=(cap.execution||[]).join('/');
   return `<div class="param"><span>类别</span><span class="val" style="color:${catColor}">${cats}</span></div>
-    <div class="param"><span>数据精度</span><span class="val" style="color:#c678dd;font-size:10px">${data}</span></div>
-    <div class="param"><span>执行精度</span><span class="val" style="color:#c678dd;font-size:10px">${exec}</span></div>`;
+    <div class="param"><span>数据精度</span><span class="val" style="color:#b44dff;font-size:10px">${data}</span></div>
+    <div class="param"><span>执行精度</span><span class="val" style="color:#b44dff;font-size:10px">${exec}</span></div>`;
 }
 
 // ─── Hardware: preset (non-editable) + custom (editable via modal) ───
@@ -1260,9 +1333,15 @@ function showCustomHWModal(){
 function closeCustomHWModal(){document.getElementById('hw-modal').classList.remove('show')}
 function closeCustomHWLinkModal(){document.getElementById('hw-link-modal').classList.remove('show')}
 function cancelCustomHWAll(){closeCustomHWModal();closeCustomHWLinkModal();}
+function _uniqueHwId(base){
+  // 自定义硬件 id 由名称生成：与既有 block id 冲突时加后缀，避免顶掉已有设备
+  let id=base, i=2;
+  while(blocks[id]){ id=base+'-'+(i++); }
+  return id;
+}
 function nextCustomHW(){
   let name=document.getElementById('c-name').value||'custom';
-  let id=name.toLowerCase().replace(/\s+/g,'-');
+  let id=_uniqueHwId(name.toLowerCase().replace(/\s+/g,'-'));
   pendingCustom={
     name:name, id:id, kind:id.toUpperCase(),
     type:document.getElementById('c-type').value,
@@ -1277,11 +1356,11 @@ function nextCustomHW(){
   let rows=_linkKinds().map(k=>
     `<div style="display:flex;align-items:center;gap:6px;margin:3px 0">
        <span style="flex:1;font-size:11px;color:var(--text2)">↔ ${k}</span>
-       <input data-lk="${k}" type="number" step="1" min="0" value="${_linkBwDefaultFor(k)}" style="width:90px;padding:3px 6px;background:#2c313a;border:1px solid var(--border);color:var(--text);border-radius:3px">
+       <input data-lk="${k}" type="number" step="1" min="0" value="${_linkBwDefaultFor(k)}" style="width:90px;padding:3px 6px;background:#0d0d20;border:1px solid var(--border);color:var(--text);border-radius:0px">
      </div>`).join('');
   rows+=`<div style="display:flex;align-items:center;gap:6px;margin:3px 0">
      <span style="flex:1;font-size:11px;color:var(--text2)">↔ 同种类互连</span>
-     <input data-lk="__self__" type="number" step="1" min="0" value="${LINK_FALLBACK}" style="width:90px;padding:3px 6px;background:#2c313a;border:1px solid var(--border);color:var(--text);border-radius:3px">
+     <input data-lk="__self__" type="number" step="1" min="0" value="${LINK_FALLBACK}" style="width:90px;padding:3px 6px;background:#0d0d20;border:1px solid var(--border);color:var(--text);border-radius:0px">
    </div>`;
   box.innerHTML=rows;
   document.getElementById('c-link-title').textContent='设备 '+pendingCustom.name+'（种类 '+pendingCustom.kind+'）';
@@ -1328,10 +1407,10 @@ function _makeHWBlock(type, label, compute, mem, rBW, wBW, editable, forceId, fo
   el.className='block hw-block';el.id=id;el.style.left=x+'px';el.style.top=y+'px';
   el.style.borderColor=color;
   let paramsHTML=editable
-    ? `<div class="param"><span>算力</span><input value="${compute}" onchange="uHP('${id}','compute',this.value)" style="width:90px;background:#1e2229;border:1px solid #444;color:#ccc;font-size:10px;padding:2px 4px;border-radius:3px;text-align:right"></div>
-       <div class="param"><span>容量</span><input value="${mem}" onchange="uHP('${id}','mem',this.value)" style="width:90px;background:#1e2229;border:1px solid #444;color:#ccc;font-size:10px;padding:2px 4px;border-radius:3px;text-align:right"></div>
-       <div class="param"><span>读带宽</span><input value="${rBW}" onchange="uHP('${id}','rBW',this.value)" style="width:90px;background:#1e2229;border:1px solid #444;color:#ccc;font-size:10px;padding:2px 4px;border-radius:3px;text-align:right"></div>
-       <div class="param"><span>写带宽</span><input value="${wBW}" onchange="uHP('${id}','wBW',this.value)" style="width:90px;background:#1e2229;border:1px solid #444;color:#ccc;font-size:10px;padding:2px 4px;border-radius:3px;text-align:right"></div>
+    ? `<div class="param"><span>算力</span><input value="${compute}" onchange="uHP('${id}','compute',this.value)" style="width:90px;background:#0d0d20;border:2px solid #2a2a5e;color:#ccc;font-size:10px;padding:2px 4px;border-radius:0px;text-align:right"></div>
+       <div class="param"><span>容量</span><input value="${mem}" onchange="uHP('${id}','mem',this.value)" style="width:90px;background:#0d0d20;border:2px solid #2a2a5e;color:#ccc;font-size:10px;padding:2px 4px;border-radius:0px;text-align:right"></div>
+       <div class="param"><span>读带宽</span><input value="${rBW}" onchange="uHP('${id}','rBW',this.value)" style="width:90px;background:#0d0d20;border:2px solid #2a2a5e;color:#ccc;font-size:10px;padding:2px 4px;border-radius:0px;text-align:right"></div>
+       <div class="param"><span>写带宽</span><input value="${wBW}" onchange="uHP('${id}','wBW',this.value)" style="width:90px;background:#0d0d20;border:2px solid #2a2a5e;color:#ccc;font-size:10px;padding:2px 4px;border-radius:0px;text-align:right"></div>
        ${_capSummary(type)}`
     : `<div class="param"><span>算力</span><span class="val">${compute}</span></div>
        <div class="param"><span>容量</span><span class="val">${mem}</span></div>
@@ -1353,7 +1432,7 @@ function _makeHWBlock(type, label, compute, mem, rBW, wBW, editable, forceId, fo
   el.querySelectorAll('.port').forEach(p=>p.addEventListener('mousedown',portMouseDown));
   makeDraggable(el);
   updateLinkSelects();
-  updateStatus('已添加 '+label);
+  updateStatus('◈ 已添加 '+label);
 }
 function uHP(id,k,v){if(blocks[id]){blocks[id].params=blocks[id].params||{};blocks[id].params[k]=v}}
 function deleteBlock(id){
@@ -1366,7 +1445,7 @@ function deleteBlock(id){
   Object.entries(blocks).forEach(([wid,b])=>{ if(b.type==='weight'&&b.parentHW===id){detachWeight(wid);} });
   delete blocks[id];
   drawConnections();updateLinkSelects();refreshConnList();
-  updateStatus('已删除 '+id);
+  updateStatus('✕ 已删除 '+id);
 }
 
 // ─── Load operators from model ───
@@ -1407,7 +1486,7 @@ function loadModel(){
       let kvHint=k.is_kv_dependent?'KV动态':'';
       let cat=_opCategory(k.op_type||'');
       let catLabel=cat==='NONLINEAR'?'非线性':'线性';
-      let catColor=cat==='NONLINEAR'?'#d19a66':'#61afef';
+      let catColor=cat==='NONLINEAR'?'#ff8c42':'#00e5ff';
       let dataPrec=k.data_precision||k.precision||'FP16';
       let execPrec=k.execution_precision||'—(纯数据)';
       // 输入/输出/中间数据
@@ -1426,7 +1505,7 @@ function loadModel(){
       let outPorts=(k.outputs||[]).map((d,do_)=>`<div class="port output" data-port="${id}_out${do_}" data-port-type="output" style="top:${outTop(do_)}%" title="输出${do_+1}: ${d}"><span class="plabel">out${do_+1}</span></div>`).join('');
       let midPort=(k.intermediates||[]).length?`<div class="port mid" data-port="${id}_mid" data-port-type="mid" title="中间值: ${(k.intermediates||[]).join(', ')}"><span class="plabel">中间值</span></div>`:'';
       el.innerHTML=`
-        <div class="op-row"><span>算子</span><b>${k.name||k.op_type||''}</b><span style="margin-left:auto;font-size:9px;font-weight:700;color:${catColor};border:1px solid ${catColor};border-radius:3px;padding:0 4px">${catLabel}</span>${kvHint?`<span style="font-size:9px;color:#c792ea;font-weight:600">${kvHint}</span>`:''}</div>
+        <div class="op-row"><span>算子</span><b>${k.name||k.op_type||''}</b><span style="margin-left:auto;font-size:9px;font-weight:700;color:${catColor};border:1px solid ${catColor};border-radius:0px;padding:0 4px">${catLabel}</span>${kvHint?`<span style="font-size:9px;color:#c792ea;font-weight:600">${kvHint}</span>`:''}</div>
         <div class="op-row"><span>类型</span><span class="val">${k.op_type||''}</span></div>
         <div class="op-row"><span>ID</span><span class="val">${k.id||''}</span></div>
         <div class="op-row"><span>数据精度</span><span class="val p">${dataPrec}</span></div>
@@ -1436,7 +1515,7 @@ function loadModel(){
         ${midData?`<div class="op-row"><span>中间值</span><span class="val mid">${midData}</span></div>`:''}
         <div class="op-row"><span>形状</span><span class="val">${attrs}</span></div>
         <div class="op-row"><span>输入</span><span class="val" style="color:#7aa2c4">${inData}</span></div>
-        <div class="op-row"><span>输出</span><span class="val" style="color:#d19a66">${outData}</span></div>
+        <div class="op-row"><span>输出</span><span class="val" style="color:#ff8c42">${outData}</span></div>
         <div class="op-row rec-row"><span>推荐设备</span><span class="val rec-val" data-rec="1">…(载入中)</span></div>
         <div class="op-row"><span>运行设备</span><span class="op-tag" data-tag="1" title="拖动此标签到硬件方块 = 算子在该设备运行">—(未放置)</span></div>
         <div style="margin-top:6px;border-top:1px dashed #3a4050;padding-top:4px"><span class="split-btn" onclick="openSplitModal('${id}')">✂ 切割</span></div>
@@ -1450,7 +1529,7 @@ function loadModel(){
       makeTagDraggable(blocks[id].tagEl, id);
       makeDraggable(el);
     });
-    updateStatus('已加载模型: '+m+', 每层'+kernels.length+'个算子 (输入'+wp.input_tokens+' token, 生成'+wp.generate_tokens+' token)');
+    updateStatus('⏺ 已加载模型: '+m+', 每层'+kernels.length+'个算子 (输入'+wp.input_tokens+' token, 生成'+wp.generate_tokens+' token)');
     renderLayerBar();
     loadWeights().then(()=>applyRecommendation());
   }).catch(e=>updateStatus('加载模型失败: '+e));
@@ -1463,7 +1542,7 @@ function renderLayerBar(){
   if(!bar){
     bar=document.createElement('div');
     bar.id='layer-bar';
-    bar.style.cssText='position:absolute;top:12px;left:50%;transform:translateX(-50%);z-index:150;background:rgba(23,26,33,.92);border:1px solid var(--border2);border-radius:20px;padding:6px 16px;font-size:12px;color:var(--text);display:flex;gap:10px;align-items:center;box-shadow:var(--shadow);backdrop-filter:blur(6px)';
+    bar.style.cssText='position:absolute;top:12px;left:50%;transform:translateX(-50%);z-index:150;background:rgba(10,10,26,.92);border:1px solid #2a2a5e;border-radius:2px;padding:6px 16px;font-size:12px;color:var(--text);display:flex;gap:10px;align-items:center;box-shadow:0 0 16px rgba(0,229,255,.15);backdrop-filter:blur(6px)';
     document.getElementById('canvas-wrap').appendChild(bar);
   }
   bar.innerHTML=`<span style="color:var(--accent);font-weight:600">📚 图层</span>
@@ -1534,7 +1613,7 @@ function loadWeights(){
       let hwId=backToId[wb.device];
       if(hwId){ groupWeightToHW(id, hwId); }
     });
-    updateStatus('已加载 '+currentWeights.length+' 个权重块——拖动其标签到硬件方块即可决定权重放置');
+    updateStatus('⏺ 已加载 '+currentWeights.length+' 个权重块——拖动其标签到硬件方块即可决定权重放置');
   }).catch(e=>{updateStatus('加载权重块失败: '+e); currentWeights=[];});
 }
 function fmtBytes(b){
@@ -1558,7 +1637,7 @@ function groupWeightToHW(wid, hwId){
     item.className='op-in-hw'; item.id=wid+'_wgrp';
     item.style.borderColor='#6a5acd';
     let wbadge = wb.isPartition
-      ? `<span style="color:#e5c07b">(片${wb.partIndex+1}/${wb.partTotal})</span>`
+      ? `<span style="color:#ffcc00">(片${wb.partIndex+1}/${wb.partTotal})</span>`
       : ((wb.parts&&wb.parts.length)?`<span style="color:#b8a6e0">(${wb.parts.length}片)</span>`:'');
     item.innerHTML=`<span style="color:#c792ea;font-weight:600" title="${wb.weightId}">${wb.weightId}</span>
       <span style="color:var(--text2)">${wb.weightClass||''} · ${fmtBytes(wb.bytes)}</span>
@@ -1569,7 +1648,7 @@ function groupWeightToHW(wid, hwId){
   hw.weightGroup=hw.weightGroup||[]; if(!hw.weightGroup.includes(wid)) hw.weightGroup.push(wid);
   _updateWTag(wid);
   syncWeightConns(wid);
-  updateStatus('权重 '+wb.weightId+' 已放置到 '+hwId+'（该硬件存储此权重）');
+  updateStatus('◈ 权重 '+wb.weightId+' 已放置到 '+hwId+'（该硬件存储此权重）');
 }
 function detachWeight(wid){
   let wb=blocks[wid]; if(!wb)return;
@@ -1650,7 +1729,7 @@ function _replaceWithWeightParts(wid, wb, parts){
     let el=document.createElement('div');
     el.className='block w-block'; el.id=pid; el.style.left=x+'px'; el.style.top=y+'px';
     el.innerHTML=`
-      <div class="w-head"><b title="${p.partition_id}">${p.partition_id}</b><span class="w-class">${wb.weightClass||''}</span><span style="margin-left:auto;font-size:9px;font-weight:700;color:#e5c07b;border:1px solid #e5c07b;border-radius:3px;padding:0 4px">片${pi+1}/${parts.length}</span></div>
+      <div class="w-head"><b title="${p.partition_id}">${p.partition_id}</b><span class="w-class">${wb.weightClass||''}</span><span style="margin-left:auto;font-size:9px;font-weight:700;color:#ffcc00;border:1px solid #ffcc00;border-radius:0px;padding:0 4px">片${pi+1}/${parts.length}</span></div>
       <div class="w-row"><span>形状</span><span class="val v">${p.rows}×${p.cols}</span></div>
       <div class="w-row"><span>大小</span><span class="val">${fmtBytes(p.bytes||0)}</span></div>
       <div class="w-row"><span>消费者</span><span class="val">${(wb.consumers||[]).length} 个算子</span></div>
@@ -1816,11 +1895,11 @@ function makeDraggable(el){
 }
 document.addEventListener('mousemove',e=>{
   if(dragState){
-    let wrap=document.getElementById('canvas-wrap');
-    let dx=(e.clientX-dragState.ox)/canvasScale, dy=(e.clientY-dragState.oy)/canvasScale;
-    let wx=wrap.scrollLeft,wy=wrap.scrollTop;
-    dragState.el.style.left=(dx+wx-252)+'px';
-    dragState.el.style.top=(dy+wy-0)+'px';
+    // 用 canvas 的实时包围盒换算（已含滚动与缩放），保持方块在光标下不跳位；
+    // 旧的 (dx+scrollLeft-252) 混用屏幕坐标与画布坐标，滚动后拖拽会漂移。
+    let canvasRect=document.getElementById('canvas').getBoundingClientRect();
+    dragState.el.style.left=((e.clientX-canvasRect.left-dragState.ox)/canvasScale)+'px';
+    dragState.el.style.top =((e.clientY-canvasRect.top -dragState.oy)/canvasScale)+'px';
     drawConnections();
   }
 });
@@ -1930,7 +2009,7 @@ function groupOpToHW(opId, hwId){
   }
   _updateOpTag(opId);
   drawConnections();   // 重绘：数据与算子同设备的线隐藏，跨设备线保留
-  updateStatus('算子 '+opId+' 已映射到 '+hwId);
+  updateStatus('▶ 算子 '+opId+' 已映射到 '+hwId);
 }
 function detachOp(opId){
   let op=blocks[opId]; if(!op||!op.parentHW)return;
@@ -1947,7 +2026,7 @@ function detachOp(opId){
   }
   _updateOpTag(opId);
   drawConnections();   // 解除映射后重绘：跨设备数据线重新显示
-  updateStatus('算子 '+opId+' 已解除映射');
+  updateStatus('◀ 算子 '+opId+' 已解除映射');
 }
 
 // ─── Connections list ───
@@ -1987,7 +2066,7 @@ document.addEventListener('mousemove',e=>{
   let line=document.createElementNS('http://www.w3.org/2000/svg','line');
   line.setAttribute('x1',x1);line.setAttribute('y1',y1);
   line.setAttribute('x2',x2);line.setAttribute('y2',y2);
-  line.setAttribute('stroke','#61afef');line.setAttribute('stroke-width','2');
+  line.setAttribute('stroke','#00e5ff');line.setAttribute('stroke-width','2');
   line.setAttribute('stroke-dasharray','6 3');
   line.classList.add('temp-line');
   svg.appendChild(line);
@@ -2000,7 +2079,7 @@ document.addEventListener('mouseup',e=>{
   let target=document.elementFromPoint(e.clientX,e.clientY);
   if(target&&target.dataset.port&&target.dataset.port!==connectState.from){
     connections.push({from:connectState.from,to:target.dataset.port});
-    updateStatus('已连接: '+connectState.from+' �� '+target.dataset.port);
+    updateStatus('已连接: '+connectState.from+' → '+target.dataset.port);
     drawConnections();
   }
   connectState=null;
@@ -2029,7 +2108,7 @@ function drawConnections(){
     let path=document.createElementNS('http://www.w3.org/2000/svg','path');
     let mx=(x1+x2)/2, my=(y1+y2)/2;
     path.setAttribute('d',`M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}`);
-    path.setAttribute('stroke','#5c6370');path.setAttribute('stroke-width','2');
+    path.setAttribute('stroke','#3a3a6a');path.setAttribute('stroke-width','2');
     path.setAttribute('fill','none');
     path.setAttribute('pointer-events','stroke');   // 只让线本身可点击，不遮挡下方方块
     path.style.cursor='pointer';
@@ -2058,9 +2137,9 @@ function selectConn(i){
   drawConnections();
   if(selectedConn>=0 && connections[selectedConn]){
     let c=connections[selectedConn];
-    updateStatus('已选中连线：'+c.from+' → '+c.to+'（点 × 或按 Delete 删除）');
+    updateStatus('◎ 已选中连线：'+c.from+' → '+c.to+'（点 × 或按 Delete 删除）');
   }else{
-    updateStatus('就绪。拖拽硬件方块和算子来配置。');
+    updateStatus('◈ 就绪。拖拽硬件方块和算子来配置拓扑。');
   }
 }
 function _portVisible(el){
@@ -2275,7 +2354,7 @@ function runSim(){
   // 完整序列化画布状态
   let st=serializeState();
   let mapNote = st.mappedCount>0 ? ('已映射'+st.mappedCount+'个算子') : '（当前未映射任何算子，使用配置默认）';
-  updateStatus('正在运行 '+exp+(runValidation?'':'（已跳过校验）')+' ... '+mapNote);
+  updateStatus('⏳ 正在运行 '+exp+(runValidation?'':'（已跳过校验）')+' ... '+mapNote);
 
   fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({experiment:exp, compute_map:st.run_map, state:st,
@@ -2301,7 +2380,7 @@ function runSim(){
       <div class="metric"><span>🔗 搬运</span><span class="v">${((bd.transfer_ns||0)/1e6).toFixed(2)} ms</span></div>
       <div class="metric"><span>🔁 同步等待</span><span class="v">${((bd.sync_ns||0)/1e6).toFixed(2)} ms</span></div>
       <div class="metric"><span>💾 本地读写</span><span class="v">${(((bd.local_read_ns||0)+(bd.local_write_ns||0))/1e6).toFixed(2)} ms</span></div>
-      <div class="metric"><span>🔎 瓶颈</span><span class="v" style="color:${d.bottleneck==='COMPUTE'?'#61afef':'#e06c75'}">${d.bottleneck||'?'}</span></div>
+      <div class="metric"><span>🔎 瓶颈</span><span class="v" style="color:${d.bottleneck==='COMPUTE'?'#00e5ff':'#ff3366'}">${d.bottleneck||'?'}</span></div>
       <div class="metric"><span>✂ 权重切片数</span><span class="v">${d.weight_shard_count||0}</span></div>
       ${mvHtml}
       ${_criticalPathHtml(d.critical_path)}
@@ -2309,7 +2388,7 @@ function runSim(){
       ${_friendlyTip(d)}
       <div style="color:var(--green);font-size:10px;margin-top:6px">${mapNote}${d.override_applied>=0?' · 后端覆盖'+d.override_applied+'个算子':''}${pendingSplits.length?' · 张量并行切片'+pendingSplits.length+'条':''}</div>
     `);
-    updateStatus('完成: '+d.total_latency_ms.toFixed(2)+'ms, 瓶颈='+d.bottleneck+' ('+mapNote+')');
+    updateStatus('✓ 完成: '+d.total_latency_ms.toFixed(2)+'ms, 瓶颈='+d.bottleneck+' ('+mapNote+')');
   }).catch(e=>{
     showResult('错误', '<h3 style="color:var(--red)">错误</h3><div>'+e.message+'</div>');
   });
@@ -2504,16 +2583,25 @@ function saveConfig(){
   let hwYaml='devices:\n';
   Object.entries(blocks).forEach(([id,b])=>{
     if(b.type==='operator')return;
+    let p=b.params||{};
     let lt=String(b.linkType||b.type).toUpperCase();
     let linkLines='';
     let links=b.links||{};
-    if(lt!==String(b.type).toUpperCase() || Object.keys(links).length){
+    if(Object.keys(links).length){
       linkLines+='    links:\n';
       Object.entries(links).forEach(([k,v])=>{ linkLines+=`      ${k}: ${v}\n`; });
     }
+    // 用画布上用户填写的真实参数（此前硬编码 300 TFLOPS / 80 GB，丢失用户配置）
+    let compute = _parseUnit(p.compute)/1e12 || 300;
+    let mem = _parseUnit(p.mem)/1e9 || 80;
+    let rBW = _parseUnit(p.rBW)/1e9 || 2000;
+    let wBW = _parseUnit(p.wBW)/1e9 || 2000;
     hwYaml+=`  - id: ${id}\n    type: ${b.type}\n` +
       (lt!==String(b.type).toUpperCase() ? `    link_type: ${lt}\n` : '') +
-      `    compute:\n      peak_tflops: 300\n    memory:\n      capacity_gb: 80\n` + linkLines;
+      `    compute:\n      peak_tflops: ${compute}\n` +
+      `    memory:\n      capacity_gb: ${mem}\n` +
+      `      read_bandwidth_gbs: ${rBW}\n` +
+      `      write_bandwidth_gbs: ${wBW}\n` + linkLines;
   });
   // 链路系统：N×N 对称带宽表（link_bw_gbs 格式，GB/s）
   let icYaml='# 链路系统：N×N 对称链路带宽表（GB/s）\nlink_bw_gbs:\n';
@@ -2529,7 +2617,12 @@ function saveConfig(){
   updateStatus('已保存: hardware_gui.yaml, interconnect_gui.yaml（含链路带宽表）');
 }
 
-function updateStatus(msg){document.getElementById('status').textContent=msg||'就绪。'}
+function updateStatus(msg){
+  let el=document.getElementById('status');
+  el.textContent=msg||'◈ 就绪。';
+  el.style.borderColor='#00e5ff60';
+  setTimeout(()=>{el.style.borderColor='#1a1a3e'},600);
+}
 
 // ─── 依赖关系图抽屉 ───
 function toggleDepDrawer(){
@@ -2562,7 +2655,7 @@ function renderDepDrawer(){
   function _trunc(s,n){s=String(s||'');return s.length>n?s.slice(0,n-1)+'…':s;}
 
   // 端口配色：同一数据名（端口）的所有线同色；按首次出现顺序循环调色板，保证相邻端口不同色
-  const PALETTE=['#61afef','#d19a66','#98c379','#c678dd','#e06c75','#56b6c2','#e5c07b','#f08d49'];
+  const PALETTE=['#00e5ff','#ff8c42','#00ff88','#b44dff','#ff3366','#ffcc00','#8899cc','#ff2d95'];
   let dataColor={}, colorIdx=0;
   function colorOf(d){let k=_nd(d);if(!(k in dataColor)){let i=colorIdx%PALETTE.length;dataColor[k]={color:PALETTE[i],marker:'arr'+i};colorIdx++;}return dataColor[k];}
 
@@ -2656,53 +2749,53 @@ function renderDepDrawer(){
   edges.forEach(e=>{svg+=`<path d="${edgePath(e)}" fill="none" stroke="${e.c.color}" stroke-width="2.6" stroke-linecap="round" marker-end="url(#${e.c.marker})" opacity="0.92"/>`;});
 
   // 输入/输出终端
-  svg+=`<rect x="${inTerm.x}" y="${inTerm.y}" width="${inTerm.w}" height="${inTerm.h}" rx="10" fill="#1d2a1f" stroke="#98c379" stroke-width="1.7"/>
-    <text x="${inTerm.x+14}" y="${inTerm.y+32}" font-size="14" font-weight="700" fill="#98c379">${_esc(inTerm.label)}</text>
-    <circle cx="${inTerm.x+inTerm.w}" cy="${inTerm.y+inTerm.h/2}" r="5" fill="#98c379" stroke="#0f1115" stroke-width="1.6"/>`;
-  svg+=`<rect x="${outTerm.x}" y="${outTerm.y}" width="${outTerm.w}" height="${outTerm.h}" rx="10" fill="#2a1c1e" stroke="#e06c75" stroke-width="1.7"/>
-    <text x="${outTerm.x+14}" y="${outTerm.y+32}" font-size="14" font-weight="700" fill="#e06c75">${_esc(outTerm.label)}</text>
-    <circle cx="${outTerm.x}" cy="${outTerm.y+outTerm.h/2}" r="5" fill="#e06c75" stroke="#0f1115" stroke-width="1.6"/>`;
+  svg+=`<rect x="${inTerm.x}" y="${inTerm.y}" width="${inTerm.w}" height="${inTerm.h}" rx="2" fill="#0a1a14" stroke="#00ff88" stroke-width="1.7"/>
+    <text x="${inTerm.x+14}" y="${inTerm.y+32}" font-size="14" font-weight="700" fill="#00ff88">${_esc(inTerm.label)}</text>
+    <circle cx="${inTerm.x+inTerm.w}" cy="${inTerm.y+inTerm.h/2}" r="5" fill="#00ff88" stroke="#070614" stroke-width="1.6"/>`;
+  svg+=`<rect x="${outTerm.x}" y="${outTerm.y}" width="${outTerm.w}" height="${outTerm.h}" rx="2" fill="#1a0a10" stroke="#ff3366" stroke-width="1.7"/>
+    <text x="${outTerm.x+14}" y="${outTerm.y+32}" font-size="14" font-weight="700" fill="#ff3366">${_esc(outTerm.label)}</text>
+    <circle cx="${outTerm.x}" cy="${outTerm.y+outTerm.h/2}" r="5" fill="#ff3366" stroke="#070614" stroke-width="1.6"/>`;
 
   // 权重节点
   wList.forEach(w=>{
     let p=wPos[w.weight_id], h=wH[w.weight_id];
-    svg+=`<rect x="${p.x}" y="${p.y}" width="${WW}" height="${h}" rx="10" fill="#241f33" stroke="#6a5acd" stroke-width="1.6"/>
+    svg+=`<rect x="${p.x}" y="${p.y}" width="${WW}" height="${h}" rx="2" fill="#1a1030" stroke="#b44dff" stroke-width="1.6"/>
       <text x="${p.x+12}" y="${p.y+20}" font-size="12" font-weight="700" fill="#c792ea">${_esc(_trunc(w.weight_id,17))}</text>
       <text x="${p.x+12}" y="${p.y+37}" font-size="9.5" fill="#b8a6e0">${_esc(w.weight_class||'')} · ${fmtBytes(w.bytes||0)}</text>
-      <circle cx="${p.x+WW}" cy="${p.y+h/2}" r="5" fill="#c792ea" stroke="#0f1115" stroke-width="1.6"/>`;
+      <circle cx="${p.x+WW}" cy="${p.y+h/2}" r="5" fill="#c792ea" stroke="#070614" stroke-width="1.6"/>`;
   });
 
   // 算子节点
   chain.forEach(k=>{
     let p=pos[k.id], h=hh[k.id];
     let cat=_opCategory(k.op_type||'');
-    let catColor=cat==='NONLINEAR'?'#d19a66':'#61afef';
+    let catColor=cat==='NONLINEAR'?'#ff8c42':'#00e5ff';
     let isGlobal=(k.id==='embedding'||k.id==='lm_head');
-    let stroke=isGlobal?'#e5c07b':catColor;
-    let fill=isGlobal?'#282516':'#1c2129';
+    let stroke=isGlobal?'#ffcc00':catColor;
+    let fill=isGlobal?'#1a1a10':'#0d0d20';
     let ports='';
-    (k.inputs||[]).forEach((d,i)=>{ports+=`<circle cx="${p.x}" cy="${inY(k,i)}" r="5" fill="#61afef" stroke="#0f1115" stroke-width="1.6"/>`;});
+    (k.inputs||[]).forEach((d,i)=>{ports+=`<circle cx="${p.x}" cy="${inY(k,i)}" r="5" fill="#00e5ff" stroke="#070614" stroke-width="1.6"/>`;});
     let outs=(k.outputs||[]).concat(k.intermediates||[]);
-    outs.forEach((d,j)=>{ports+=`<circle cx="${p.x+NODE_W}" cy="${outY(k,j)}" r="5" fill="#d19a66" stroke="#0f1115" stroke-width="1.6"/>`;});
-    svg+=`<rect x="${p.x}" y="${p.y}" width="${NODE_W}" height="${h}" rx="10" fill="${fill}" stroke="${stroke}" stroke-width="1.6"/>
+    outs.forEach((d,j)=>{ports+=`<circle cx="${p.x+NODE_W}" cy="${outY(k,j)}" r="5" fill="#ff8c42" stroke="#070614" stroke-width="1.6"/>`;});
+    svg+=`<rect x="${p.x}" y="${p.y}" width="${NODE_W}" height="${h}" rx="2" fill="${fill}" stroke="${stroke}" stroke-width="1.6"/>
       <rect x="${p.x}" y="${p.y}" width="${NODE_W}" height="5" rx="2.5" fill="${stroke}" opacity="0.5"/>
-      <text x="${p.x+13}" y="${p.y+23}" font-size="13" font-weight="700" fill="#e8ecf2">${_esc(_trunc(k.name||k.id,15))}</text>
-      <text x="${p.x+13}" y="${p.y+39}" font-size="9.5" fill="#8a93a5">${_esc((k.op_type||'')+(k.is_kv_dependent?' · KV':''))}</text>
+      <text x="${p.x+13}" y="${p.y+23}" font-size="13" font-weight="700" fill="#d8e0ff">${_esc(_trunc(k.name||k.id,15))}</text>
+      <text x="${p.x+13}" y="${p.y+39}" font-size="9.5" fill="#6b7394">${_esc((k.op_type||'')+(k.is_kv_dependent?' · KV':''))}</text>
       ${ports}`;
   });
 
   let totalLayers=currentWorkload.num_layers||32;
   let legend=`<div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;font-size:10.5px;color:var(--text2);background:#14171d;border:1px solid var(--border);border-radius:6px;padding:9px 13px;margin-bottom:10px">
-    <span><b style="color:#61afef">●</b> 输入端口（左）</span>
-    <span><b style="color:#d19a66">●</b> 输出端口（右）</span>
-    <span><b style="color:#e5c07b">■</b> 全局算子（Embedding/LMHead）</span>
-    <span><b style="color:#98c379">■</b> 输入 / <b style="color:#e06c75">■</b> 输出</span>
+    <span><b style="color:#00e5ff">●</b> 输入端口（左）</span>
+    <span><b style="color:#ff8c42">●</b> 输出端口（右）</span>
+    <span><b style="color:#ffcc00">■</b> 全局算子（Embedding/LMHead）</span>
+    <span><b style="color:#00ff88">■</b> 输入 / <b style="color:#ff3366">■</b> 输出</span>
     <span>同色线 = 同一数据端口</span>
     <span style="margin-left:auto;color:var(--text2)">📚 显示 L0 模板，其余 ${totalLayers-1} 层折叠</span>
   </div>
   <div style="font-size:10px;color:var(--text2);background:#14171d;border:1px solid var(--border);border-radius:6px;padding:7px 12px;margin-bottom:10px">
-    💡 本图 ${chain.length} 个节点 = <b style="color:#e5c07b">Embedding</b> + <b>16 个 L0 算子</b> + <b style="color:#e5c07b">LMHead</b>；
-    画布默认只显示 L0 的 16 个算子（Embedding/LMHead 为折叠的全局算子，运行时会展开到完整 ${totalLayers} 层）。
+    💡 本图 ${chain.length} 个节点 = <b style="color:#ffcc00">Embedding</b> + <b>${kernels.length} 个 L0 算子</b> + <b style="color:#ffcc00">LMHead</b>；
+    画布默认只显示 L0 的 ${kernels.length} 个算子（Embedding/LMHead 为折叠的全局算子，运行时会展开到完整 ${totalLayers} 层）。
   </div>`;
 
   body.innerHTML=`${legend}<div style="overflow:auto;max-height:calc(100vh - 120px);background:radial-gradient(circle,#1d2129 1px,transparent 1px);background-size:20px 20px;border:1px solid var(--border);border-radius:8px;padding:12px">
@@ -2811,7 +2904,7 @@ function _replaceWithSlices(oldId, slices, dim, devices, ruleIdx){
     let x=oldX+i*410, y=oldY;
     let cat=_opCategory(sk.op_type||'');
     let catLabel=cat==='NONLINEAR'?'非线性':'线性';
-    let catColor=cat==='NONLINEAR'?'#d19a66':'#61afef';
+    let catColor=cat==='NONLINEAR'?'#ff8c42':'#00e5ff';
     let dataPrec=sk.data_precision||sk.precision||'FP16';
     let execPrec=sk.execution_precision||'—(纯数据)';
     let inData=(sk.inputs||[]).join(', ')||'—';
@@ -2827,7 +2920,7 @@ function _replaceWithSlices(oldId, slices, dim, devices, ruleIdx){
     let el=document.createElement('div');
     el.className='block op-block'; el.id=id; el.style.left=x+'px'; el.style.top=y+'px';
     el.innerHTML=`
-      <div class="op-row"><span>算子</span><b>${sk.name||sk.id||''}</b><span style="margin-left:auto;font-size:9px;font-weight:700;color:#e5c07b;border:1px solid #e5c07b;border-radius:3px;padding:0 4px" title="沿 ${dim} 切分的第 ${i+1}/${slices.length} 片">切片${i+1}/${slices.length}</span></div>
+      <div class="op-row"><span>算子</span><b>${sk.name||sk.id||''}</b><span style="margin-left:auto;font-size:9px;font-weight:700;color:#ffcc00;border:1px solid #ffcc00;border-radius:0px;padding:0 4px" title="沿 ${dim} 切分的第 ${i+1}/${slices.length} 片">切片${i+1}/${slices.length}</span></div>
       <div class="op-row"><span>类型</span><span class="val">${sk.op_type||''} <span style="color:${catColor};font-size:9px">${catLabel}</span></span></div>
       <div class="op-row"><span>ID</span><span class="val">${sk.id||''}</span></div>
       <div class="op-row"><span>数据精度</span><span class="val p">${dataPrec}</span></div>
@@ -2837,7 +2930,7 @@ function _replaceWithSlices(oldId, slices, dim, devices, ruleIdx){
       ${midData?`<div class="op-row"><span>中间值</span><span class="val mid">${midData}</span></div>`:''}
       <div class="op-row"><span>形状</span><span class="val">${attrs}</span></div>
       <div class="op-row"><span>输入</span><span class="val" style="color:#7aa2c4">${inData}</span></div>
-      <div class="op-row"><span>输出</span><span class="val" style="color:#d19a66">${outData}</span></div>
+      <div class="op-row"><span>输出</span><span class="val" style="color:#ff8c42">${outData}</span></div>
       <div class="op-row"><span>运行设备</span><span class="op-tag" data-tag="1" title="拖动此标签到硬件方块 = 该切片算子在该设备运行">—(未放置)</span></div>
       ${inPorts}${outPorts}${midPort}
     `;

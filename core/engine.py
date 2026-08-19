@@ -61,7 +61,16 @@ class PerformanceModel:
         peak = getattr(hw, "get_peak_compute", None)
         if peak is not None:
             prec = op.execution_precision if op.execution_precision is not None else op.data_precision
-            p = peak(prec) if prec is not None else peak(None)
+            if prec is not None:
+                # 按精度算力：显式配置了该精度但峰值为 0 → 该硬件不提供此精度的算力，
+                # 不得静默回退到单值峰值（会得到偏小的虚假计算时间），直接返回 0。
+                peak_by = getattr(hw, "peak_throughput_by_precision", None)
+                if peak_by and prec in peak_by:
+                    p = peak_by[prec]
+                    if p and p > 0:
+                        return int(op.flops / (p * eff) * 1e9)
+                    return 0
+            p = peak(None)
             if p and p > 0:
                 return int(op.flops / (p * eff) * 1e9)
         if hw.peak_compute_flops == 0:
@@ -72,7 +81,9 @@ class PerformanceModel:
         hw = self.hw.get(hw_id)
         if hw is None:
             return 0
-        if data_size_bytes == 0 or hw.read_bandwidth_Bps == 0:
+        if data_size_bytes == 0:
+            return 0
+        if hw.read_bandwidth_Bps == 0:
             return hw.read_latency_ns
         return int(hw.read_latency_ns + data_size_bytes / hw.read_bandwidth_Bps * 1e9)
 
@@ -80,7 +91,9 @@ class PerformanceModel:
         hw = self.hw.get(hw_id)
         if hw is None:
             return 0
-        if data_size_bytes == 0 or hw.write_bandwidth_Bps == 0:
+        if data_size_bytes == 0:
+            return 0
+        if hw.write_bandwidth_Bps == 0:
             return hw.write_latency_ns
         return int(hw.write_latency_ns + data_size_bytes / hw.write_bandwidth_Bps * 1e9)
 
@@ -252,7 +265,10 @@ class Scheduler:
         self._check_ready_ops()
         while not self.queue.is_empty():
             event = self.queue.pop()
-            self.clock_ns = event.end_time_ns
+            # 时钟单调推进：事件按 start 升序出队，但并行事件（起点相同、终点不同，
+            # 如不同链路上的同时搬运）会让“结束时刻”倒退；取 max 保证时钟不回退，
+            # 后续所有调度决策（start/sync/日志）都基于正确的时间轴。
+            self.clock_ns = max(self.clock_ns, event.end_time_ns)
             self.event_trace.append(event)
             self._process_event(event)
             self._check_ready_ops()
@@ -335,8 +351,8 @@ class Scheduler:
                             self.op_states[oid] = OpState.WAITING; return
                         src = dev
                     src_ready = self.data_state.ready_time_on(pid, src)
-                    self.notes.append(f"[ALL-GATHER] 算子 {oid} 权重分片 {pid} 从 {src} 汇集"
-                                      f" (就绪 {src_ready}ns)")
+                    self._note(f"[ALL-GATHER] 算子 {oid} 权重分片 {pid} 从 {src} 汇集"
+                               f" (就绪 {src_ready}ns)")
                     self._ensure_data_at(pid, src, target_hw, src_ready,
                                          max_arrival_ns, transfer_ns_total, transfer_events,
                                          oid, op, None, local_read_ns_total)
@@ -348,8 +364,10 @@ class Scheduler:
                 if src not in copies:
                     self._note(
                         f"算子 {oid} 输入 {in_id}: 用户指定从 {src} 读, 但该设备无此数据副本"
-                        f"(现有副本: {list(copies.keys())})。无法按用户指令执行，该输入标记为未就绪。")
-                    self.op_states[oid] = OpState.FINISHED  # 避免死循环（见 v3 通道）
+                        f"(现有副本: {list(copies.keys())})。无法按用户指令执行，该算子被标记为阻塞(BLOCKED)。")
+                    # 标记为 BLOCKED 而非 WAITING/FINISHED：不进入死循环重试，
+                    # 也不被计为“已完成”；由 collect_result/validate_completion 如实上报。
+                    self.op_states[oid] = OpState.BLOCKED
                     return
                 src_ready = copies.get(src, -1)
                 if src_ready < 0:
@@ -364,8 +382,8 @@ class Scheduler:
                     self._note(f"算子 {oid} 输入 {in_id}: 无任何就绪副本，等待。")
                     self.op_states[oid] = OpState.WAITING; return
                 src_ready = self.data_state.ready_time_on(in_id, src)
-                self.notes.append(f"[参考] 算子 {oid} 输入 {in_id} 数据源就近选择 {src}"
-                                  f" (就绪 {src_ready}ns)")
+                self._note(f"[参考] 算子 {oid} 输入 {in_id} 数据源就近选择 {src}"
+                           f" (就绪 {src_ready}ns)")
                 self._ensure_data_at(in_id, src, target_hw, src_ready,
                                      max_arrival_ns, transfer_ns_total, transfer_events,
                                      oid, op, spec, local_read_ns_total)

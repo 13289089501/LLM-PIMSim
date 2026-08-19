@@ -16,7 +16,7 @@ devices:
       peak_tflops: 45.9          # BF16 AMX 峰值
       parallelism: 1
     memory:
-      capacity_gb: 512
+      capacity_mb: 4             # v3.1：CPU 为纯执行单元，仅保留极小运行缓存（与出厂预设一致）
       read_bandwidth_gbs: 307.2
       write_bandwidth_gbs: 307.2
       read_latency_ns: 90
@@ -84,7 +84,7 @@ devices:
       Softmax: 0.10
       LayerNorm: 0.10
     memory:
-      capacity_mb: 64
+      capacity_mb: 256           # 与参考实验 04_ic_reference 口径一致（256MB）
       read_bandwidth_gbs: 128
       write_bandwidth_gbs: 32
       read_latency_ns: 10

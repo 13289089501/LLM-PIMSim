@@ -16,6 +16,7 @@ from typing import Optional
 # ---------------------------------------------------------------- 枚举
 class OpState(IntEnum):
     WAITING = 0; READY = 1; RUNNING = 2; FINISHED = 3
+    BLOCKED = 4   # 无法满足用户固定(PINNED)数据源等硬性条件而永久阻塞（计入未完成）
 
 
 class DataType(IntEnum):

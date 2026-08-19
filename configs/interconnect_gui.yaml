@@ -1,0 +1,37 @@
+# 链路系统：N×N 对称链路带宽表（GB/s）
+link_bw_gbs:
+  CPU:
+      CPU: 300
+      DRAM: 200
+      DRAM_PIM: 120
+      GPU: 100
+      RERAM_PIM: 100
+      SRAM: 200
+      SRAM_PIM: 200
+  DRAM:
+      DRAM: 200
+  DRAM_PIM:
+      DRAM: 150
+      DRAM_PIM: 600
+      RERAM_PIM: 100
+      SRAM: 200
+      SRAM_PIM: 150
+  GPU:
+      DRAM: 150
+      DRAM_PIM: 120
+      GPU: 600
+      RERAM_PIM: 100
+      SRAM: 200
+      SRAM_PIM: 200
+  RERAM_PIM:
+      DRAM: 100
+      RERAM_PIM: 128
+      SRAM: 100
+  SRAM:
+      DRAM: 200
+      SRAM: 1000
+  SRAM_PIM:
+      DRAM: 200
+      RERAM_PIM: 100
+      SRAM: 500
+      SRAM_PIM: 1500

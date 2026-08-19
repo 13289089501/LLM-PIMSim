@@ -1,0 +1,21 @@
+# 05_1_mapping.yaml —— 空白模板（默认所有算子放 GPU，可自行改）
+default:
+  compute_device: gpu0
+  data_source: auto
+rules:
+  - op_type: GEMM
+    device: gpu0
+  - op_type: LayerNorm
+    device: gpu0
+  - op_type: Softmax
+    device: gpu0
+  - op_type: Residual
+    device: gpu0
+  - op_type: Activation
+    device: gpu0
+  - op_type: Embedding
+    device: gpu0
+  - op_type: LMHead
+    device: gpu0
+  - op_type: KVCacheUpdate
+    device: gpu0

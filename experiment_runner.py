@@ -116,11 +116,6 @@ def _construct_plan(exp_path, compute_map_override, weight_blocks, splits_overri
                     f"（本实验硬件: {sorted(devices.keys())}）。请检查画布设备与实验硬件是否一致。")
             if k in compute_map:
                 compute_map[k] = hw
-            else:
-                for oid in compute_map:
-                    if oid == k:
-                        compute_map[oid] = hw
-                        break
 
     # 运行前充分校验：所有算子的目标设备必须存在且能执行该算子
     bad = []

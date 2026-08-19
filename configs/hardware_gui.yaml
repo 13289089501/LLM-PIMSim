@@ -1,0 +1,73 @@
+devices:
+  - id: hw0
+    type: GPU
+    compute:
+      peak_tflops: 300
+    memory:
+      capacity_gb: 80
+  - id: hw1
+    type: DRAM_PIM
+    compute:
+      peak_tflops: 300
+    memory:
+      capacity_gb: 80
+  - id: hw2
+    type: SRAM_PIM
+    compute:
+      peak_tflops: 300
+    memory:
+      capacity_gb: 80
+  - id: hw3
+    type: RERAM_PIM
+    compute:
+      peak_tflops: 300
+    memory:
+      capacity_gb: 80
+  - id: hw4
+    type: DRAM
+    compute:
+      peak_tflops: 300
+    memory:
+      capacity_gb: 80
+  - id: w0
+    type: weight
+    compute:
+      peak_tflops: 300
+    memory:
+      capacity_gb: 80
+  - id: w1
+    type: weight
+    compute:
+      peak_tflops: 300
+    memory:
+      capacity_gb: 80
+  - id: w2
+    type: weight
+    compute:
+      peak_tflops: 300
+    memory:
+      capacity_gb: 80
+  - id: w3
+    type: weight
+    compute:
+      peak_tflops: 300
+    memory:
+      capacity_gb: 80
+  - id: w4
+    type: weight
+    compute:
+      peak_tflops: 300
+    memory:
+      capacity_gb: 80
+  - id: w5
+    type: weight
+    compute:
+      peak_tflops: 300
+    memory:
+      capacity_gb: 80
+  - id: w6
+    type: weight
+    compute:
+      peak_tflops: 300
+    memory:
+      capacity_gb: 80

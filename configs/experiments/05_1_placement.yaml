@@ -1,0 +1,11 @@
+# 05_1_placement.yaml —— 空白模板（默认所有数据放 GPU）
+default_device: gpu0
+initial:
+  - data_type: WEIGHT
+    devices: [gpu0]
+  - data_type: KV_CACHE
+    devices: [gpu0]
+  - data_type: ACTIVATION
+    devices: [gpu0]
+  - data_type: TEMPORARY
+    devices: [gpu0]

@@ -17,7 +17,7 @@ from enum import IntEnum
 from typing import Callable, Dict, List, Optional
 
 from core.common import (DataObject, DataType, Operator, OperatorCategory)
-from core.precision import PrecisionLevel
+from core.precision import PrecisionLevel, precision_to_bytes
 
 
 # =================================================================
@@ -378,48 +378,59 @@ class WorkloadBuilder:
     def _bind_cost(self, k: Kernel, layer, seq, batch):
         h, f, nh, hd = self.h, self.f, self.nh, self.hd
         V = self.vocab
+        # m = batch×seq：总 token 数。所有非 KV 公式必须乘 m，
+        # 否则 prefill（seq=2048）的计算量被按“单 token”低估约 2048 倍。
         m = batch * seq
         H4 = h * 4
-        W8 = 1
+        W8 = 1   # 权重按 INT8 ≈ 1B（与 OPERATOR_PRECISION_RULES 数据精度一致）
 
         if k.op_type == KernelType.LAYERNORM:
-            k.cost = Cost.fixed(5 * h, 2 * H4); k.cost_fn = None
+            k.cost = Cost.fixed(5 * m * h, 2 * m * h * 4); k.cost_fn = None
         elif k.op_type == KernelType.RESIDUAL:
-            k.cost = Cost.fixed(0, 2 * H4); k.cost_fn = None
+            k.cost = Cost.fixed(0, 3 * m * h * 4); k.cost_fn = None
         elif k.op_type == KernelType.ACTIVATION:
             if k.attributes.get("kind") == "rope":
-                k.cost = Cost.fixed(6 * h, 2 * H4)
+                k.cost = Cost.fixed(6 * m * h, 4 * m * h * 4)   # q,k → q_rot,k_rot
             else:
-                k.cost = Cost.fixed(3 * f, 2 * f * 4)
+                k.cost = Cost.fixed(3 * m * f, 3 * m * f * 4)   # gate,up → silu
             k.cost_fn = None
         elif "kv_cache_write" in k.id:
-            k.cost = Cost.fixed(0, h); k.cost_fn = None
+            # 写 K、V 两份（INT4≈1B/元素）到 KV 缓存
+            k.cost = Cost.fixed(0, 2 * m * nh * hd); k.cost_fn = None
         elif "kv_cache_read" in k.id:
             def _kvr(kv):
-                return (0, kv * nh * hd)
+                return (0, 2 * kv * nh * hd)
             k.cost_fn = _kvr; k.cost = None
         elif "attn_score" in k.id:
+            # QK^T：Q[m×hd]·K^T[hd×kv] 每头一份 → flops=2·m·nh·hd·kv；
+            # 内存 = Q(m·nh·hd·1B, INT8) + scores(m·nh·kv·4B, FP32) + K(kv·nh·hd·1B, INT4)
             def _qk(kv):
-                return (2 * nh * hd * kv, (nh * hd * 4) + (kv * nh * hd * 0.5) + (kv * nh * 4))
+                return (2 * m * nh * hd * kv,
+                        m * nh * hd + 4 * m * nh * kv + kv * nh * hd)
             k.cost_fn = _qk; k.cost = None
         elif "softmax" in k.id:
             def _sm(kv):
-                return (3 * nh * kv, 2 * (kv * nh * 4))
+                return (3 * m * nh * kv, 2 * (4 * m * nh * kv))
             k.cost_fn = _sm; k.cost = None
         elif "attn_context" in k.id:
+            # AV：probs[m×kv]·V[kv×hd] 每头一份 → flops=2·m·kv·nh·hd
             def _ac(kv):
-                return (2 * nh * hd * kv, (kv * nh * 4) + (kv * nh * hd * 0.5) + (nh * hd * 4))
+                return (2 * m * kv * nh * hd,
+                        4 * m * nh * kv + kv * nh * hd + m * nh * hd)
             k.cost_fn = _ac; k.cost = None
         elif "qkv_proj" in k.id:
-            k.cost = Cost.fixed(3 * 2 * h * h, (m * h + 3 * h) * 4 + 3 * h * h * W8)
+            # [m×h]·[h×3h]：flops=2·m·3h·h；内存=输入(m·h) + 输出(m·3h) + 权重(3h²·1B)
+            k.cost = Cost.fixed(2 * m * 3 * h * h, (m * h + m * 3 * h) * 4 + 3 * h * h * W8)
             k.cost_fn = None
         elif "ffn_down" in k.id:
-            k.cost = Cost.fixed(2 * f * h, (m * f + h) * 4 + f * h * W8)
+            # [m×f]·[f×h]
+            k.cost = Cost.fixed(2 * m * f * h, (m * f + m * h) * 4 + f * h * W8)
             k.cost_fn = None
         else:
             M = k.attributes.get("M", m); K = k.attributes.get("K", h); N = k.attributes.get("N", h)
             c = 2 * M * K * N
-            mc = (M + N) * 4 + K * N * W8
+            # 内存 = 输入激活(M·K) + 输出激活(M·N) + 权重(K·N)
+            mc = (M * K + M * N) * 4 + K * N * W8
             k.cost = Cost.fixed(c, mc); k.cost_fn = None
         return k
 
@@ -461,7 +472,7 @@ class WorkloadBuilder:
 
         self._add_global_ops(all_kernels, num_layers, prefill_seq, batch, kv_start, kv_end)
 
-        groups = layer_groups or [LayerGroup(1, num_layers)]
+        groups = layer_groups or [LayerGroup(0, num_layers - 1)]   # 实际算子层为 L0..L(N-1)
         kv_min = 2 * self.nh * self.hd * kv_start * self.b * batch * num_layers
         kv_max = 2 * self.nh * self.hd * kv_end * self.b * batch * num_layers
 
@@ -469,7 +480,8 @@ class WorkloadBuilder:
             config={"hidden": self.h, "ffn_size": self.f, "num_heads": self.nh,
                     "head_dim": self.hd, "vocab": self.vocab,
                     "num_layers": num_layers, "pbytes": self.b,
-                    "input_tokens": input_tokens, "generate_tokens": generate_tokens},
+                    "input_tokens": input_tokens, "generate_tokens": generate_tokens,
+                    "batch": batch},
             kernels=all_kernels, layers=layers,
             kv_range_bytes=(kv_min, kv_max),
             layer_groups=groups,
@@ -486,8 +498,9 @@ class WorkloadBuilder:
             id="embedding", name="Embedding", op_type=KernelType.EMBEDDING,
             inputs=["input_ids", "embed_weight"], intermediates=[], outputs=["hidden_states"],
             cost=Cost.fixed(0, m * h * 4), attributes={}))
-        lm_flops = 2 * h * V
-        lm_mem = (m * h + V) * 4 + h * V * 1
+        # LMHead：[m×h]·[h×V] → flops=2·m·h·V；内存=输入(m·h) + 输出(m·V) + 权重(h·V·1B, FP8)
+        lm_flops = 2 * m * h * V
+        lm_mem = (m * h + m * V) * 4 + h * V * 1
         kernels.append(Kernel(
             id="lm_head", name="LMHead", op_type=KernelType.LMHEAD,
             inputs=[f"L{num_layers-1}_layer_output", "lm_head_weight"], intermediates=[],
@@ -528,8 +541,10 @@ def _data_dtype_lookup(name: str) -> DataType:
         return DataType.WEIGHT
     if "kv" in n:
         return DataType.KV_CACHE
-    if "logits" in n or "input_ids" in n:
+    if "logits" in n:
         return DataType.OUTPUT
+    if "input_ids" in n:
+        return DataType.INPUT
     return DataType.TEMPORARY
 
 
@@ -539,16 +554,130 @@ class WorkloadAdapter:
     def __init__(self, workload: Workload):
         self.workload = workload
 
+    def _weight_size(self, kernel, wid: str, data_bytes: int):
+        """按张量形状估算权重字节数：GEMM 权重 = K×N×字节；
+        Embedding/LMHead 权重 = 词表×隐层×字节。形状未知返回 None（走剩余均摊）。"""
+        name = (kernel.name or "").strip()
+        cfg = self.workload.config or {}
+        if name == "Embedding":
+            v, h = cfg.get("vocab"), cfg.get("hidden")
+            return (v or 0) * (h or 0) * data_bytes
+        if name == "LMHead":
+            v, h = cfg.get("vocab"), cfg.get("hidden")
+            return (v or 0) * (h or 0) * data_bytes
+        K = kernel.attributes.get("K")
+        N = kernel.attributes.get("N")
+        if isinstance(K, (int, float)) and isinstance(N, (int, float)):
+            return K * N * data_bytes
+        return None
+
+    def _attn_operand_sizes(self, kernel, m_tok, nh, hd, kv):
+        """注意力/KV 家族算子的逐张量尺寸归属（与 _bind_cost 公式一致）。
+        这些算子的维含 kv_len 字符串占位，无法用数值 M/K/N 比例拆分，
+        故按模板张量形状直接给出。返回 {data_id: bytes}。"""
+        n = kernel.name or ""
+        ids_in = list(kernel.inputs)
+        ids_mid = list(kernel.intermediates)
+        ids_out = list(kernel.outputs)
+        sz = {}
+        if n == "Attn_Score" and len(ids_in) >= 2 and ids_mid:
+            sz[ids_in[0]] = m_tok * nh * hd * 1      # Q
+            sz[ids_in[1]] = kv * nh * hd * 1         # K
+            sz[ids_mid[0]] = m_tok * nh * kv * 4     # scores(FP32)
+        elif n == "Softmax" and len(ids_in) >= 1:
+            sz[ids_in[0]] = m_tok * nh * kv * 4      # scores in
+            if ids_out:
+                sz[ids_out[0]] = m_tok * nh * kv * 4  # probs out
+        elif n == "Attn_Context" and len(ids_in) >= 2 and ids_out:
+            sz[ids_in[0]] = m_tok * nh * kv * 4      # probs
+            sz[ids_in[1]] = kv * nh * hd * 1         # V
+            sz[ids_out[0]] = m_tok * nh * hd * 1     # ctx
+        elif n == "KV_Cache_Read" and ids_out:
+            each = kv * nh * hd * 1                  # full_k / full_v
+            for d in ids_out:
+                sz[d] = each
+        elif n == "KV_Cache_Write" and ids_in:
+            each = m_tok * nh * hd * 1               # k_rot / v 写回
+            for d in ids_in:
+                sz[d] = each
+        elif n == "RoPE" and ids_out:
+            base = m_tok * self.workload.config.get("hidden", nh * hd) * 4
+            for d in ids_in:
+                sz[d] = base
+            for d in ids_out:
+                sz[d] = base
+        return sz
+
     def _data_sizes(self, kernel, per_data_mem_hint: dict = None) -> dict:
+        """按数据类型估算每个数据对象尺寸（修正：不再把算子总内存均摊到所有 id）：
+          - 权重：K×N×字节（GEMM）/ 词表×隐层×字节（Embedding/LMHead），
+            用算子固定规则的数据精度字节；
+          - KV 缓存：2×nh×hd×kv_len×字节（K+V 两份，取 KV 终点即最大规模）；
+          - 其余（激活/中间值）：kernel 剩余内存（总内存扣除权重/KV 后）按 id 均摊。"""
+        wl = self.workload
+        cfg = wl.config or {}
+        nh = int(cfg.get("num_heads", 128))
+        hd = int(cfg.get("head_dim", 128))
+        pbytes = int(cfg.get("pbytes", 2))
+        kv_end = max(1, int(wl.decode_kv_end or wl.decode_kv_start or 0))
         ids = list(kernel.inputs) + list(kernel.intermediates) + list(kernel.outputs)
-        # v3.2 KV 建模：KV 相关算子用 max（KV 终点即 input_tokens+generate_tokens 的规模），
-        # 使 KV 增长真正反映到算子存储量；非 KV 算子 min==max。
         total = kernel.cost.memory_bytes_max if kernel.cost and kernel.cost_fn is not None \
             else (kernel.cost.memory_bytes_min if kernel.cost else 0)
         if not ids or total <= 0:
             return {d: 0 for d in ids}
-        base = total / len(ids)
-        return {d: base for d in ids}
+
+        rule = operator_rule_by_name(kernel.name)
+        data_bytes = 1
+        if rule is not None and rule["data"] is not None:
+            data_bytes = max(1, precision_to_bytes(rule["data"]))
+
+        sizes = {}
+        fixed = 0.0
+        for d in ids:
+            dt = _data_dtype_lookup(d)
+            if dt == DataType.WEIGHT:
+                sz = self._weight_size(kernel, d, data_bytes)
+                if sz:
+                    sizes[d] = float(sz)
+                    fixed += float(sz)
+            elif dt == DataType.KV_CACHE:
+                sz = 2.0 * nh * hd * kv_end * pbytes   # K+V 两份，INT4≈pbytes 字节
+                sizes[d] = sz
+                fixed += sz
+        # 注意力/KV 家族：按模板张量形状精确归属（覆盖上面的粗略拆分）
+        m_tok = int(cfg.get("batch", 1)) * int(cfg.get("input_tokens", 2048))
+        for d, sz in self._attn_operand_sizes(kernel, m_tok, nh, hd, kv_end).items():
+            if d not in sizes and d in ids:
+                sizes[d] = float(sz)
+                fixed += float(sz)
+        rest_ids = [d for d in ids if d not in sizes]
+        if rest_ids:
+            rest = max(0.0, total - fixed)
+            # 有数值型 M/K/N 的 GEMM 类算子：输入激活共享 M·K、输出/中间值共享 M·N，
+            # 按形状比例拆分，避免“均摊”把大张量（如注意力分数）摊给相邻小张量。
+            M = kernel.attributes.get("M")
+            K = kernel.attributes.get("K")
+            N = kernel.attributes.get("N")
+            if all(isinstance(x, (int, float)) for x in (M, K, N)):
+                in_pool = M * K * 4
+                out_pool = M * N * 4
+                pool = in_pool + out_pool
+                scale = min(1.0, rest / pool) if pool > 0 else 0.0
+                in_rest = [d for d in kernel.inputs if d not in sizes]
+                out_rest = [d for d in kernel.intermediates + list(kernel.outputs) if d not in sizes]
+                if in_rest:
+                    base_in = in_pool * scale / len(in_rest)
+                    for d in in_rest:
+                        sizes[d] = base_in
+                if out_rest:
+                    base_out = out_pool * scale / len(out_rest)
+                    for d in out_rest:
+                        sizes[d] = base_out
+            else:
+                base = rest / len(rest_ids)
+                for d in rest_ids:
+                    sizes[d] = base
+        return sizes
 
     def build_executable(self) -> dict:
         wl = self.workload

@@ -233,7 +233,7 @@ def parse_peak_throughput(comp: dict, pre: dict):
             try:
                 prec = _PL.from_name(str(pname))
             except ValueError:
-                raise ConfigError(f"peak_throughput 含未知精度: '{pname}'。可选: FP32/FP16/BF16/INT8/INT4")
+                raise ConfigError(f"peak_throughput 含未知精度: '{pname}'。可选: FP32/FP16/BF16/FP8/INT8/INT4")
             if isinstance(entry, dict):
                 peak_by_precision[prec] = throughput_to_flops(
                     entry.get("value", 0), entry.get("unit", ""))
@@ -333,7 +333,7 @@ def parse_hardware(doc: dict) -> dict:
                         precision.append(PrecisionLevel.from_name(str(pname)))
                     except ValueError:
                         raise ConfigError(f"设备 {dev_id} 的 supported_precision 含未知精度: '{pname}'."
-                                          f" 可选 FP32/FP16/INT8/INT4")
+                                          f" 可选 FP32/FP16/BF16/FP8/INT8/INT4")
             else:
                 precision = _default_precision_list()
 
