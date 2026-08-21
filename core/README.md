@@ -1,7 +1,8 @@
-# LLM-PIMSim v3 core —— 九大系统解耦架构
+# LLM-PIMSim v4 core —— 十大系统解耦架构
 
-本目录是 v3 解耦重构后的**核心层**。按功能划分为 **9 大系统**，外加 1 个公共底层
-（`common.py`，不属于"系统"，是所有系统的依赖根基）。
+本目录是 v3 解耦重构后的**核心层**。按功能划分为 **10 大系统**（v4 新增
+「硬件设计系统」），外加 1 个公共底层（`common.py`，不属于"系统"，是所有系统的
+依赖根基）。
 
 ## 依赖方向（单向，禁止反向/循环）
 
@@ -19,6 +20,9 @@ core.hardware_sys（硬件系统）    core.operator_sys（算子系统）    co
    │                                └──────► core.splitter（切割系统，统一算子+权重切分）
    │                                            │
    ▼                                            ▼
+core.design_sys（硬件设计系统，v4 新增：读 hardware_sys/link_sys 的
+   │             HardwareConfig/LinkBandwidthTable 格式，输出同格式对象）
+   ▼
 core.validator（校验系统）  core.exporter（输出系统）
             │                     │
             ▼                     ▼
@@ -36,6 +40,7 @@ core.engine（核心调度器）← 用硬件 + 链路系统的带宽表算搬�
 | 算子系统 | `operator_sys.py` | 18 类算子固定规则、Kernel/Workload 建模、WorkloadBuilder、WorkloadAdapter |
 | 权重系统 | `weight_sys.py` | WeightBlock/WeightPartition、权重归类、build_weight_blocks |
 | 切割系统 | `splitter.py` | `split_kernel_dict`（算子沿 M/K/N 切）+ `make_weight_partitions`（权重 rows/cols 切） |
+| **硬件设计系统（v4 新增）** | `design_sys.py` | 用户设计规格 → 硬件结构模型 → 参数推导（输出与自定义硬件同格式的 HardwareConfig + 链路对角线条目）；含介质/计算资源/互联/密度/部署层级预设库与独立算子效率规则 |
 | 校验系统 | `validator.py` | ConstraintChecker（A/B/C/D/E/W1 规则） |
 | 输出系统 | `exporter.py` | 结果 dict 序列化、JSON 落盘、控制台报告 |
 | 核心调度器 | `engine.py` | PerformanceModel、离散事件内核、Scheduler、SimulationEngine |

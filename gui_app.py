@@ -739,6 +739,32 @@ def api_link_defaults():
     return jsonify({"table": DEFAULT_LINK_BW_TABLE, "fallback": DEFAULT_LINK_BW_GBS})
 
 
+@app.route("/api/design/presets")
+def api_design_presets():
+    """硬件设计模块预设库：总体架构 / 存储介质 / 计算资源 / 互联方式 /
+    计算密度等级 / 部署层级。前端「硬件设计」向导据此渲染选项。"""
+    from core.design_sys import presets
+    return jsonify(presets())
+
+
+@app.route("/api/design/derive", methods=["POST"])
+def api_design_derive():
+    """硬件设计模块参数推导：用户设计规格（JSON）→ 硬件结构模型 + 推导参数。
+    设计规格经三阶段（设计规格 → 结构模型 → 参数推导）生成与自定义硬件同格式的
+    硬件对象（HardwareConfig 同格式），由前端注入画布后走原有仿真流程。"""
+    from core.design_sys import derive_design
+    from config_loader import ConfigError
+    d = request.get_json() or {}
+    try:
+        return jsonify(derive_design(d))
+    except ConfigError as e:
+        return jsonify({"ok": False, "error": str(e)})
+    except Exception as e:
+        import traceback
+        return jsonify({"ok": False, "error": str(e),
+                        "trace": traceback.format_exc()[-1500:]}), 500
+
+
 @app.route("/api/models")
 def api_models():
     return jsonify(list_models())
@@ -1099,6 +1125,7 @@ body{font:13px/1.5 var(--font-pixel);background:var(--bg);color:var(--text);disp
     <button class="btn-add" onclick="addPresetHW('SRAM')" style="border-color:var(--border2);color:#00e5ff">SRAM（纯存储）</button>
     <button class="btn-add" onclick="addPresetHW('DRAM')" style="border-color:var(--border2);color:#ff8c42">DRAM（纯存储）</button>
     <button class="btn-add" onclick="showCustomHWModal()" style="border-color:var(--accent);color:var(--accent)">+ 自定义硬件</button>
+    <button class="btn-add" onclick="showDesignModal()" style="border-color:#b44dff;color:#b44dff">✚ 硬件设计（自动生成参数）</button>
   </div>
 
   <div class="section">
@@ -1264,6 +1291,28 @@ body{font:13px/1.5 var(--font-pixel);background:var(--bg);color:var(--text);disp
   </div>
 </div>
 
+<!-- 硬件设计模块（v4）：从真实硬件结构出发，自动生成与自定义硬件同格式的参数 -->
+<div class="modal-overlay" id="design-modal">
+  <div class="modal" style="width:600px">
+    <h3>硬件设计（基于真实硬件结构自动生成参数）</h3>
+    <div style="font-size:10px;color:var(--text2);line-height:1.5;margin-bottom:10px">从硬件架构出发选择存储介质 / 计算资源 / 互联与组织方式，系统建立硬件结构模型并自动推导出峰值算力、容量、带宽、延迟、精度能力与算子效率——最终输出与「自定义硬件」完全一致的硬件对象，共用同一仿真流程。</div>
+    <label>设计名称（将作为设备 id / 链路种类）</label>
+    <input id="d-name" value="my-design">
+    <label>总体架构</label>
+    <select id="d-arch" onchange="renderDesignForm()">
+      <option value="IN_MEMORY">存内计算（CIM）—— 计算发生在存储阵列内部</option>
+      <option value="NEAR_MEMORY">近存计算（NMC）—— 存储与计算分离、内部互联传输</option>
+    </select>
+    <div id="d-form"></div>
+    <div id="d-preview" style="font-size:11px;color:var(--text1);margin-top:12px;line-height:1.6"></div>
+    <div class="btn-row">
+      <button onclick="closeDesignModal()" style="background:#444;color:#ccc">取消</button>
+      <button onclick="deriveDesign()" style="background:var(--accent);color:#1a1d23">推导参数</button>
+      <button id="d-add-btn" onclick="addDesignToCanvas()" style="display:none;background:var(--green);color:#1a1d23">✔ 加入画布</button>
+    </div>
+  </div>
+</div>
+
 <script>
 // ─── State ───
 let blocks={}, hwCounter=0, opCounter=0, connections=[], linkId=0;
@@ -1394,7 +1443,270 @@ function confirmCustomHW(){
   closeCustomHWLinkModal();
 }
 
-function _makeHWBlock(type, label, compute, mem, rBW, wBW, editable, forceId, forceColor, backId, precisionStr, linkType, links){
+// ════════════════════════════════════════════════════════════════
+// 硬件设计模块（v4）：基于真实硬件结构自动生成参数
+// 三阶段：用户设计规格 → 硬件结构模型 → 参数推导（后端 core.design_sys）
+// ════════════════════════════════════════════════════════════════
+let DESIGN_PRESETS=null;   // 预设库（/api/design/presets）
+let lastDesign=null;       // 最近一次推导结果
+let nmcStorages=[{media:'DRAM',cap:8,unit:'GB'},{media:'SRAM',cap:512,unit:'MB'}];
+let nmcComputes=[{resource:'MAC_ARRAY',count:4},{resource:'SIMD_CLUSTER',count:1}];
+function _unitToBytes(u){ return {KB:1e3,MB:1e6,GB:1e9,TB:1e12}[u]||1e9; }
+function _bytesToUnit(b,u){ return +(b/_unitToBytes(u)).toFixed(3); }
+
+function loadDesignPresets(cb){
+  fetch('/api/design/presets').then(r=>r.json()).then(p=>{
+    DESIGN_PRESETS=p||{};
+    if(cb)cb();
+  }).catch(()=>updateStatus('⚠ 无法加载硬件设计预设库'));
+}
+function showDesignModal(){
+  if(!DESIGN_PRESETS){ loadDesignPresets(()=>showDesignModal()); return; }
+  document.getElementById('design-modal').classList.add('show');
+  renderDesignForm();
+}
+function closeDesignModal(){document.getElementById('design-modal').classList.remove('show')}
+
+function renderDesignForm(){
+  let arch=document.getElementById('d-arch').value;
+  document.getElementById('d-form').innerHTML =
+    arch==='IN_MEMORY' ? cimFormHTML() : nmcFormHTML();
+  document.getElementById('d-preview').innerHTML='';
+  document.getElementById('d-add-btn').style.display='none';
+  if(arch==='IN_MEMORY'){ renderCimMediaHint(); }
+  else { renderNmcAll(); }
+}
+function _mediaOpts(sel){
+  let m=DESIGN_PRESETS.media||{};
+  return Object.keys(m).map(k=>'<option value="'+k+'"'+(k===sel?' selected':'')+'>'+(m[k].label||k)+'</option>').join('');
+}
+function _computeOpts(sel){
+  let c=DESIGN_PRESETS.computes||{};
+  return Object.keys(c).map(k=>'<option value="'+k+'"'+(k===sel?' selected':'')+'>'+(c[k].label||k)+'</option>').join('');
+}
+function _interconnectOpts(sel){
+  let i=DESIGN_PRESETS.interconnects||{};
+  return Object.keys(i).map(k=>'<option value="'+k+'"'+(k===sel?' selected':'')+'>'+(i[k].label||k)+'</option>').join('');
+}
+
+// ─── 存内计算表单 ───
+function cimFormHTML(){
+  let d=DESIGN_PRESETS.density_levels||{};
+  let denOpts=['LOW','MEDIUM','HIGH','CUSTOM'].map(k=>
+    '<option value="'+k+'"'+(k==='MEDIUM'?' selected':'')+'>'+((d[k]&&d[k].label)||k)+'</option>').join('');
+  return `
+   <label>存储介质（决定基本计算机制，无需另选计算单元）</label>
+   <select id="d-media" onchange="renderCimMediaHint()">${_mediaOpts('SRAM')}</select>
+   <div id="d-media-desc" style="font-size:10px;color:var(--text2);margin:4px 0 10px;line-height:1.5"></div>
+   <label>总存储容量</label>
+   <div style="display:flex;gap:6px;align-items:center">
+     <input id="d-cap" type="number" step="1" min="1" style="flex:1">
+     <select id="d-cap-unit" style="width:70px" onchange="renderCimMediaHint()">
+       <option value="KB">KB</option><option value="MB">MB</option><option value="GB" selected>GB</option><option value="TB">TB</option>
+     </select>
+   </div>
+   <div id="d-cap-hint" style="font-size:10px;color:var(--text2);margin:4px 0 10px;line-height:1.5"></div>
+   <label>计算资源密度 / 并行度（由介质模型转换为实际阵列数与并行度）</label>
+   <select id="d-density" onchange="renderDensityCustom()">${denOpts}</select>
+   <div id="d-density-custom" style="display:none;margin-top:6px">
+     <label>自定义密度系数（>0，1.0 = 中）</label>
+     <input id="d-density-val" type="number" step="0.1" min="0.1" value="1.5">
+   </div>
+   <label style="margin-top:8px">存储阵列规模（可选；0 = 介质默认宏块尺寸）</label>
+   <input id="d-array" type="number" step="1" min="0" value="0" placeholder="0 = 介质默认">`;
+}
+function renderCimMediaHint(){
+  let m=(DESIGN_PRESETS.media||{})[document.getElementById('d-media').value];
+  if(!m) return;
+  document.getElementById('d-media-desc').textContent=
+    '基本计算机制：'+m.mechanism+'；单个'+m.array_kind+'='+m.array_size+'。';
+  document.getElementById('d-cap-hint').innerHTML=
+    '容量范围 <b>'+m.capacity_min+' ~ '+m.capacity_max+'</b>，推荐 <b>'+m.capacity_recommend+
+    '</b>，粒度 '+m.capacity_granularity+'。超范围将无法推导。';
+  let unit=document.getElementById('d-cap-unit').value;
+  let capInput=document.getElementById('d-cap');
+  if(!capInput.value){ capInput.value=_bytesToUnit(m.capacity_bytes_recommend, unit); }
+}
+function renderDensityCustom(){
+  let box=document.getElementById('d-density-custom');
+  if(box) box.style.display=document.getElementById('d-density').value==='CUSTOM'?'block':'none';
+}
+
+// ─── 近存计算表单 ───
+function nmcFormHTML(){
+  return `
+   <div style="font-size:10px;color:var(--text2);margin-bottom:4px">存储资源（第一版建议 ≤2 种，底层数据结构不限）</div>
+   <div id="d-storages"></div>
+   <button class="btn-add" onclick="addNmcStorage()" style="font-size:10px;padding:4px 6px;width:auto;margin:4px 0 8px">+ 存储资源</button>
+   <div style="font-size:10px;color:var(--text2);margin-bottom:4px">计算资源（第一版建议 ≤2 种）</div>
+   <div id="d-computes"></div>
+   <button class="btn-add" onclick="addNmcCompute()" style="font-size:10px;padding:4px 6px;width:auto;margin:4px 0 8px">+ 计算资源</button>
+   <div style="font-size:10px;color:var(--text2);margin-bottom:4px">存储 ↔ 计算 连接（每条连接记录互联方式；有效带宽 = min(存储带宽, 互联带宽, 计算接口带宽)）</div>
+   <div id="d-conns" style="border:1px solid var(--border);padding:6px;background:#0d0d20;font-size:10px"></div>
+   <label style="margin-top:8px">资源部署层级</label>
+   <select id="d-deploy" onchange="renderNmcDeploy()">
+     <option value="CHANNEL_INTERNAL">通道内混合（每个通道内部含全部资源）</option>
+     <option value="CHANNEL_CROSS">通道间混合（不同类型资源分通道部署）</option>
+   </select>
+   <div id="d-deploy-box" style="margin-top:6px"></div>`;
+}
+function renderNmcDeploy(){
+  let cross=document.getElementById('d-deploy').value==='CHANNEL_CROSS';
+  document.getElementById('d-deploy-box').innerHTML=
+    '<label>通道数</label><input id="d-channels" type="number" min="1" step="1" value="'+(cross?2:1)+'">'+
+    (cross?'<div style="font-size:10px;color:var(--orange);margin-top:4px;line-height:1.5">通道间混合：跨通道访问增加延迟（20ns/跳），有效内部带宽按通道数折减（互联竞争）。</div>'
+          :'<div style="font-size:10px;color:var(--text2);margin-top:4px;line-height:1.5">通道内混合：全部资源在同一通道内，无跨域代价。</div>');
+}
+function addNmcStorage(){
+  if(nmcStorages.length>=2){ updateStatus('⚠ 第一版建议最多 2 种存储资源'); return; }
+  nmcStorages.push({media:'RRAM',cap:256,unit:'MB'});
+  renderNmcAll();
+}
+function addNmcCompute(){
+  if(nmcComputes.length>=2){ updateStatus('⚠ 第一版建议最多 2 种计算资源'); return; }
+  nmcComputes.push({resource:'CROSSBAR_ARRAY',count:1});
+  renderNmcAll();
+}
+function removeNmcStorage(i){ nmcStorages.splice(i,1); renderNmcAll(); }
+function removeNmcCompute(i){ nmcComputes.splice(i,1); renderNmcAll(); }
+function renderNmcAll(){
+  readNmcState();          // 先读回当前 DOM 值（保留用户已填内容）
+  let box=document.getElementById('d-storages');
+  box.innerHTML=nmcStorages.map((s,i)=>`
+    <div style="display:flex;gap:6px;align-items:center;margin:3px 0">
+      <select id="d-st-${i}-media" style="flex:2" onchange="renderNmcAll()">${_mediaOpts(s.media)}</select>
+      <input id="d-st-${i}-cap" type="number" step="1" min="1" value="${s.cap}" style="flex:1;width:60px">
+      <select id="d-st-${i}-unit" style="width:64px" onchange="renderNmcAll()">
+        ${['KB','MB','GB','TB'].map(u=>'<option value="'+u+'"'+(u===s.unit?' selected':'')+'>'+u+'</option>').join('')}
+      </select>
+      <button class="btn-add" onclick="removeNmcStorage(${i})" title="删除该存储资源" style="width:auto;padding:2px 8px;font-size:12px;color:var(--red);border-color:var(--red)">×</button>
+    </div>`).join('');
+  let cbox=document.getElementById('d-computes');
+  cbox.innerHTML=nmcComputes.map((c,i)=>`
+    <div style="display:flex;gap:6px;align-items:center;margin:3px 0">
+      <select id="d-co-${i}-resource" style="flex:2" onchange="renderNmcAll()">${_computeOpts(c.resource)}</select>
+      <label style="font-size:10px;color:var(--text2)">数量</label>
+      <input id="d-co-${i}-count" type="number" step="1" min="1" value="${c.count}" style="width:64px">
+      <button class="btn-add" onclick="removeNmcCompute(${i})" title="删除该计算资源" style="width:auto;padding:2px 8px;font-size:12px;color:var(--red);border-color:var(--red)">×</button>
+    </div>`).join('');
+  renderNmcConnMatrix();
+  renderNmcDeploy();
+}
+function readNmcState(){
+  nmcStorages.forEach((s,i)=>{
+    let m=document.getElementById('d-st-'+i+'-media'); if(m) s.media=m.value;
+    let c=document.getElementById('d-st-'+i+'-cap');  if(c) s.cap=parseFloat(c.value)||s.cap;
+    let u=document.getElementById('d-st-'+i+'-unit'); if(u) s.unit=u.value;
+  });
+  nmcComputes.forEach((c,i)=>{
+    let r=document.getElementById('d-co-'+i+'-resource'); if(r) c.resource=r.value;
+    let n=document.getElementById('d-co-'+i+'-count'); if(n) c.count=parseInt(n.value)||c.count;
+  });
+}
+function renderNmcConnMatrix(){
+  let box=document.getElementById('d-conns');
+  if(!box) return;
+  if(!nmcStorages.length||!nmcComputes.length){
+    box.innerHTML='<div style="color:var(--text2)">至少需要 1 种存储 + 1 种计算资源。</div>';
+    return;
+  }
+  // 读取既有选择（避免重渲染丢值）
+  let prev={};
+  nmcStorages.forEach((s,i)=>nmcComputes.forEach((c,j)=>{
+    let el=document.getElementById('d-conn-'+i+'-'+j); if(el) prev[i+'-'+j]=el.value;
+  }));
+  let header='<div style="display:flex;gap:6px;font-weight:700;margin-bottom:4px">'+
+    '<span style="flex:1">存储 \\ 计算</span>'+nmcComputes.map((c,j)=>'<span style="flex:2">计算 '+j+'</span>').join('')+'</div>';
+  let rows=nmcStorages.map((s,i)=>{
+    let cells=nmcComputes.map((c,j)=>{
+      let v=prev[i+'-'+j]||'NOC';
+      return '<select id="d-conn-'+i+'-'+j+'" style="flex:2;margin:2px">'+_interconnectOpts(v)+'</select>';
+    }).join('');
+    return '<div style="display:flex;gap:6px;align-items:center"><span style="flex:1">存储 '+i+'</span>'+cells+'</div>';
+  }).join('');
+  box.innerHTML=header+rows;
+}
+
+// ─── 收集设计规格 + 推导 ───
+function collectDesignSpec(){
+  let name=document.getElementById('d-name').value.trim()||'design';
+  let arch=document.getElementById('d-arch').value;
+  let dep=document.getElementById('d-deploy');
+  let spec={name:name,architecture:arch,
+            deployment:{mode:dep?dep.value:'CHANNEL_INTERNAL',
+                        channels:parseInt(document.getElementById('d-channels').value)||1}};
+  if(arch==='IN_MEMORY'){
+    spec.media=document.getElementById('d-media').value;
+    spec.capacity_bytes=Math.round((parseFloat(document.getElementById('d-cap').value)||0)
+      *_unitToBytes(document.getElementById('d-cap-unit').value));
+    spec.density=document.getElementById('d-density').value;
+    if(spec.density==='CUSTOM') spec.custom_density_factor=parseFloat(document.getElementById('d-density-val').value)||1;
+    let arr=parseInt(document.getElementById('d-array').value);
+    if(arr>0) spec.array_bytes=arr;
+  } else {
+    readNmcState();
+    spec.storages=nmcStorages.map(s=>({media:s.media,
+      capacity_bytes:Math.round((parseFloat(s.cap)||0)*_unitToBytes(s.unit))}));
+    spec.computes=nmcComputes.map(c=>({resource:c.resource,count:c.count}));
+    spec.connections=[];
+    nmcStorages.forEach((s,i)=>nmcComputes.forEach((c,j)=>{
+      let el=document.getElementById('d-conn-'+i+'-'+j);
+      spec.connections.push({storage_idx:i,compute_idx:j,interconnect:el?el.value:'NOC'});
+    }));
+  }
+  return spec;
+}
+function deriveDesign(){
+  let spec=collectDesignSpec();
+  fetch('/api/design/derive',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(spec)})
+   .then(r=>r.json()).then(res=>{
+     let box=document.getElementById('d-preview');
+     if(!res.ok){ box.innerHTML='<div style="color:var(--red);font-size:12px">✘ '+(res.error||'推导失败')+'</div>'; return; }
+     lastDesign=res;
+     box.innerHTML=designPreviewHTML(res);
+     document.getElementById('d-add-btn').style.display='';
+   })
+   .catch(e=>{document.getElementById('d-preview').innerHTML='<div style="color:var(--red)">✘ '+e+'</div>'});
+}
+function designPreviewHTML(res){
+  let d=res.device, s=res.structure;
+  let archLabel=d.architecture==='IN_MEMORY'?'存内计算':'近存计算';
+  let conns=(s.connections||[]).map(c=>
+    '存储'+c.storage_idx+' ↔ 计算'+c.compute_idx+'（'+c.interconnect+'）有效带宽 <b>'+c.effective_bw+'</b>').join('<br>');
+  let arrs=(s.arrays||[]).map(a=>a.media+' '+a.array_kind+' × '+a.count+
+    (a.per_channel&&a.per_channel.length>1?'（每通道 '+a.per_channel.join('/')+'）':'')).join('；');
+  let units=(s.units||[]).map(u=>u.resource+' × '+u.count).join('；');
+  let deployLabel=s.deployment==='CHANNEL_CROSS'?'通道间混合':'通道内混合';
+  return `
+   <div style="border-top:2px solid var(--border);padding-top:8px">
+     <div style="font-weight:700;color:var(--accent);margin-bottom:4px">◇ 推导结果（${archLabel}）</div>
+     <div><b>设备</b> ${d.id}（能力语义 ${d.type}，链路种类 ${d.kind}）</div>
+     ${s.media?'<div><b>机制</b> '+s.media+'</div>':''}
+     <div style="color:var(--text2)">结构模型：${s.channels} 通道 · ${deployLabel}${arrs?' · 阵列 '+arrs:''}${units?' · 计算 '+units:''} · 并行度 ${s.total_parallelism}</div>
+     ${conns?'<div style="color:var(--text2)">连接：<br>'+conns+'</div>':''}
+     <div style="margin-top:4px">算力 <b>${d.compute}</b> · 容量 <b>${d.mem}</b> · 读带宽 <b>${d.rBW}</b> · 写带宽 <b>${d.wBW}</b></div>
+     <div style="color:var(--text2)">读写延迟 ${d.read_lat_ns}/${d.write_lat_ns} ns · 精度 ${d.precision} · 并行度 ${d.parallelism}</div>
+     <div style="color:var(--text2)">有效内部带宽（写入链路表对角线 ${d.kind}↔${d.kind}）：<b style="color:var(--green)">${d.effective_internal_bw_gbs} GB/s</b></div>
+     <div style="color:var(--text2);font-size:10px">算子效率（GEMM ${d.efficiency.GEMM} · LayerNorm ${d.efficiency.LayerNorm} · Softmax ${d.efficiency.Softmax} · LMHead ${d.efficiency.LMHead}）</div>
+   </div>`;
+}
+function addDesignToCanvas(){
+  if(!lastDesign) return;
+  let d=lastDesign.device;
+  let diag=d.effective_internal_bw_gbs||LINK_FALLBACK;
+  // 有效内部带宽 → 全局链路表对角线（同种类自互连）
+  linkBw[d.kind]=linkBw[d.kind]||{};
+  linkBw[d.kind][d.kind]=diag;
+  let color=HW_TYPES[d.type]?HW_TYPES[d.type].color:'#b44dff';
+  let archLabel=d.architecture==='IN_MEMORY'?'存内计算':'近存计算';
+  let id=_uniqueHwId(d.id);   // 画布 id 唯一化；backId=画布 id → 走"自定义硬件"注入路径
+  _makeHWBlock(d.type, d.name+'（'+archLabel+'·设计）', d.compute, d.mem, d.rBW, d.wBW,
+    true, id, color, id, d.precision, d.kind, {[d.kind]: diag}, d.parallelism);
+  closeDesignModal();
+  updateStatus('◈ 已加入设计硬件 '+d.name+'（种类 '+d.kind+'，内部带宽 '+diag+' GB/s 已写入链路表对角线）');
+}
+
+function _makeHWBlock(type, label, compute, mem, rBW, wBW, editable, forceId, forceColor, backId, precisionStr, linkType, links, parallelism){
   let id=forceId||('hw'+(hwCounter++));
   if(!backId) backId=PRESET_BACKID[type]||id;   // 预设类型→后端真实id
   let color=forceColor||HW_TYPES[type].color;
@@ -1428,7 +1740,8 @@ function _makeHWBlock(type, label, compute, mem, rBW, wBW, editable, forceId, fo
   `;
   document.getElementById('canvas').appendChild(el);
   blocks[id]={type:type,el:el,x:x,y:y,opGroup:[],params:{compute,mem,rBW,wBW},editable,backId,precision:precisionStr,
-              linkType:String(linkType||type).toUpperCase(), links:links||{}};
+              linkType:String(linkType||type).toUpperCase(), links:links||{},
+              parallelism:parallelism||''};
   el.querySelectorAll('.port').forEach(p=>p.addEventListener('mousedown',portMouseDown));
   makeDraggable(el);
   updateLinkSelects();
@@ -2253,7 +2566,8 @@ function serializeState(){
       let p=b.params||{};
       hardware.push({id:id,type:b.type,backId:b.backId,precision:b.precision,
         compute:p.compute, mem:p.mem, rBW:p.rBW, wBW:p.wBW,
-        linkType:b.linkType||b.type, links:b.links||{}});
+        linkType:b.linkType||b.type, links:b.links||{},
+        parallelism:b.parallelism||''});
     }
   });
   let conns=connections.map(c=>({from:c.from,to:c.to,label:c.label,lat:c.lat,isLink:!!c.isLink}));
@@ -2985,6 +3299,9 @@ fetch('/api/link_defaults').then(r=>r.json()).then(d=>{
   linkBw = JSON.parse(JSON.stringify(d.table||{}));
   LINK_FALLBACK = d.fallback||100;
 }).catch(()=>{ linkBw = {}; });
+// 硬件设计模块（v4）：预加载预设库（介质/计算资源/互联/密度/部署层级），供向导渲染
+fetch('/api/design/presets').then(r=>r.json()).then(p=>{ DESIGN_PRESETS=p||{}; })
+  .catch(()=>{ DESIGN_PRESETS=null; });
 // 先拉后端硬件能力表（单一事实来源），再添加 5 类参考硬件
 // （IC 参考需要 GPU/DRAM-PIM/SRAM-PIM/ReRAM-PIM + 纯存储 DRAM 放 FFN 权重）
 fetch('/api/hardware_capability').then(r=>r.json()).then(cap=>{

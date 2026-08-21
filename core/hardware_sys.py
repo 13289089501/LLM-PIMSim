@@ -588,6 +588,8 @@ def _frontend_mem_bytes(s) -> float:
     """'64 GB' / '512 MB' → Byte。缺省按 GB。"""
     t = str(s or "").strip().upper().replace(" ", "")
     n = _frontend_number(s, 0.0)
+    if "PB" in t:
+        return n * 1e15
     if "TB" in t:
         return n * 1e12
     if "GB" in t:
@@ -603,6 +605,8 @@ def _frontend_bw_bps(s) -> float:
     """'1000 GB/s' → B/s。缺省按 GB/s。"""
     t = str(s or "").strip().upper().replace(" ", "")
     n = _frontend_number(s, 0.0)
+    if "PB" in t:
+        return n * 1e15
     if "TB" in t:
         return n * 1e12
     if "GB" in t:
@@ -640,7 +644,11 @@ def build_frontend_custom_hardware(hw_list) -> dict:
         write_bw = _frontend_bw_bps(h.get("wBW")) or pre.get("write_bw_gbs_default", 1800) * 1e9
         read_lat = int(pre.get("read_lat_ns_default", 100))
         write_lat = int(pre.get("write_lat_ns_default", 100))
-        parallel = int(pre.get("parallelism_default", 1))
+        # v4：设计模块（core.design_sys）推导出的并行度经前端透传，缺省用出厂预设
+        try:
+            parallel = int(h.get("parallelism") or pre.get("parallelism_default", 1))
+        except (TypeError, ValueError):
+            parallel = int(pre.get("parallelism_default", 1))
         eff = dict(pre.get("efficiency_default", {}))
 
         precision = []

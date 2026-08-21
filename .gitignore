@@ -41,6 +41,8 @@ dsh-deep-whale/
 dsh-plugins/
 lancecheney-dsh-plugins/
 v3.1/
+v3.2/
+v4/
 
 # 敏感凭据：GitHub 2FA 恢复码严禁入库（若已提交请从历史中移除并吊销重新生成）
 github-recovery-codes.txt
